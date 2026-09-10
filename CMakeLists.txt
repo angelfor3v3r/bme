@@ -165,7 +165,8 @@ function(bme_apply_common_config target)
         endif ()
     endif ()
 
-    # XED's static lib comes from the `mfile.py` ExternalProject. Make sure it's built before anything links it.
+    # XED's static lib comes from the `mfile.py` ExternalProject.
+    # Make sure it's built before anything links it.
     add_dependencies(${target} xed_build)
 endfunction()
 
@@ -205,7 +206,8 @@ target_link_libraries(bme_core
     PUBLIC fmt::fmt
     PRIVATE argparse::argparse ftxui::ftxui Zydis::Zydis bddisasm::bddisasm capstone_static xed bme_asm)
 
-# The TUI/CLI executable. A thin `main` over `bme_core`.
+# The TUI/CLI executable.
+# A thin `main` over `bme_core`.
 add_executable(bme src/main.cpp)
 bme_apply_common_config(bme)
 bme_apply_warnings(bme)

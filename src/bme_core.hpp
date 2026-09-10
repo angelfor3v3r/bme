@@ -148,7 +148,7 @@ struct Registers
 
 struct Step
 {
-    // Instruction. Address, machine code and disassembly text.
+    // Instruction.
     std::uint64_t             rip{};   // Instruction or data address.
     std::vector<std::uint8_t> bytes{}; // Machine code.
     std::string               text{};  // Disassembled instruction (decoder mnemonic + operands). "(bad)" if undecodable.
@@ -227,7 +227,8 @@ Registers     compose_seed(
 
 Decoded disasm_one(DisasmBackend backend, DisasmSyntax syntax, std::uint64_t address, const std::uint8_t *code, std::size_t size) noexcept;
 
-// Process-global engine access is serialized. Do not call recursively.
+// Process-global engine access is serialized.
+// Do not call recursively.
 Trace run_engine(
     std::span<std::uint8_t> code, const Registers &seed, std::size_t max_steps, DisasmBackend backend, DisasmSyntax syntax, bool seed_data_pointers
 );

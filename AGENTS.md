@@ -133,7 +133,7 @@ Never run clang-format on `src/st80.asm`. clang-format does not support MASM.
   `parse_seed`, `fault_name`.
 - Decode backends (`DisasmBackend`). `disasm_one(backend, syntax, addr, code, size)` -> `Decoded`
   (`ok`/`text`/`length`), dispatching to **Zydis** (Intel + AT&T), **bddisasm** (Intel only), **Capstone** (Intel + AT&T), or **XED** (Intel + AT&T),
-  gated by `backend_supports`, which reads the per-decoder `BACKENDS` capability table). `run_engine`/`redisasm` thread the backend through. The goal is
+  gated by `backend_supports`, which reads the per-decoder `BACKENDS` capability table. `run_engine`/`redisasm` thread the backend through. The goal is
   differential decoding - run the same bytes through each decoder and watch where they diverge -
   operand / RIP-relative rendering, instruction length, or outright decode disagreement - to
   surface decoder assumptions and bugs (e.g. whether a decoder follows RIP correctly).

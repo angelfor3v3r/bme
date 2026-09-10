@@ -1,4 +1,5 @@
-// Version metadata. CMake generates bme_version.hpp each build (cmake/GenerateVersion.cmake). Fall back to placeholders for a non-CMake compile.
+// Version metadata.
+// CMake generates bme_version.hpp each build, falling back to placeholders outside CMake.
 #if __has_include("bme_version.hpp")
 #include "bme_version.hpp"
 #else
@@ -232,7 +233,8 @@ struct BackendInfo
     bool             att_syntax{};   // Emits AT&T-syntax text.
 };
 
-// Per-decoder capability table. Adding a decoder = a new `DisasmBackend` value + a row here (plus its `--backend` choice and a `disasm_one` branch).
+// Per-decoder capability table.
+// Adding a decoder = a new `DisasmBackend` value + a row here (plus its `--backend` choice and a `disasm_one` branch).
 constexpr std::array<BackendInfo, 4> BACKENDS{{
     {.name = "Zydis", .cli = "zydis", .intel_syntax = true, .att_syntax = true},
     {.name = "bddisasm", .cli = "bddisasm", .intel_syntax = true, .att_syntax = false},
@@ -244,7 +246,8 @@ constexpr auto BACKEND_COUNT = BACKENDS.size();
 
 const auto &backend_info(DisasmBackend backend) noexcept { return BACKENDS[(std::size_t)backend]; }
 
-// Resolve a `--backend` CLI token to its enum. argparse validates the token first, so the Zydis fallback is just a safety net.
+// Resolve a `--backend` CLI token to its enum.
+// argparse validates the token first, so the Zydis fallback is just a safety net.
 auto backend_from_cli(std::string_view name) noexcept
 {
     for (std::size_t i{}; i < BACKENDS.size(); ++i)
@@ -258,7 +261,8 @@ auto backend_from_cli(std::string_view name) noexcept
     return DisasmBackend::Zydis;
 }
 
-// True if `backend` can render `syntax`. bddisasm is Intel-only, the others do both.
+// True if `backend` can render `syntax`.
+// bddisasm is Intel-only, the others do both.
 auto backend_supports(DisasmBackend backend, DisasmSyntax syntax) noexcept
 {
     auto &info = backend_info(backend);
@@ -280,7 +284,8 @@ void init()
 
 auto format_hex64_string(std::uint64_t value) { return fmt::format("0x{:016X}", value); }
 
-// Format the shortest round-tripping decimal. Add a decimal point when needed so finite output remains a decimal seed.
+// Format the shortest round-tripping decimal.
+// Add a decimal point when needed so finite output remains a decimal seed.
 template <std::floating_point T>
 auto format_float(T value)
 {
@@ -973,8 +978,8 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
     program.add_argument("--bytes").help("The input x86-64 bytes as hex, e.g. AABBCCDDEE.");
     program.add_argument("--run").flag().help("Run the code immediately after loading.");
 
-    // `.nargs(1)` after `.default_value()` is load-bearing. `default_value` resets the nargs min to 0, which makes an invalid `--syntax` value a
-    // stray positional instead of a clean "allowed options" error.
+    // Keep `.nargs(1)` after `.default_value()` for `--syntax` and `--backend`.
+    // `default_value` otherwise resets nargs min to 0, parsing invalid values as stray positionals.
     program.add_argument("--syntax")
         .default_value("intel")
         .nargs(1)
@@ -1135,7 +1140,8 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
             auto name       = entry.substr(0, equals);
             auto value_text = entry.substr(equals + 1);
 
-            // XMM register xmm0..xmm15. Hex or a decimal (optional f/l suffix).
+            // XMM register xmm0..xmm15.
+            // Hex or a decimal (optional f/l suffix).
             if (auto xmm_index = parse_xmm_index(name))
             {
                 if (auto value = compose_xmm_seed(std::string(value_text)); !value)
@@ -1148,7 +1154,8 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
                 continue;
             }
 
-            // ST register st0..st7. An 80-bit hex value or a decimal (optional f/l suffix).
+            // ST register st0..st7.
+            // An 80-bit hex value or a decimal (optional f/l suffix).
             if (auto st_index = parse_st_index(name))
             {
                 if (auto value = compose_st_seed(std::string(value_text)); !value)
@@ -1698,9 +1705,10 @@ Trace run_engine(
     SIZE_T code_region = code.size() + g_page_size - 1 & ~(g_page_size - 1);
     auto  *buffer      = (std::uint8_t *)VirtualAlloc(nullptr, code_region + g_page_size, MEM_RESERVE, PAGE_NOACCESS);
     auto  *stack       = (std::uint8_t *)VirtualAlloc(nullptr, SCRATCH_STACK_BYTES + g_page_size, MEM_RESERVE, PAGE_NOACCESS);
-    auto  *data = (std::uint8_t *)VirtualAlloc((void *)scratch_reserve_base(), SCRATCH_DATA_BYTES + (g_page_size * 2), MEM_RESERVE, PAGE_NOACCESS);
 
-    // The displayed scratch address is part of the seed contract, so do not silently use another address.
+    // Users can seed registers with the displayed scratch address.
+    // Reserve this region at its fixed base instead of falling back elsewhere.
+    auto *data = (std::uint8_t *)VirtualAlloc((void *)scratch_reserve_base(), SCRATCH_DATA_BYTES + (g_page_size * 2), MEM_RESERVE, PAGE_NOACCESS);
 
     auto release_regions = [&buffer, &stack, &data]() noexcept
     {
@@ -1765,8 +1773,8 @@ Trace run_engine(
     // The data region is zeroed with one guard page on each side.
     // RDI and RSI default here so string instructions work without setup. Other registers can use the displayed address.
     auto data_base     = (std::uint64_t)(data + g_page_size);
-    auto effective_rdi = (seed_data_pointers && seed[Reg::RDI] == 0) ? data_base : seed[Reg::RDI];
-    auto effective_rsi = (seed_data_pointers && seed[Reg::RSI] == 0) ? data_base : seed[Reg::RSI];
+    auto effective_rdi = seed_data_pointers && seed[Reg::RDI] == 0 ? data_base : seed[Reg::RDI];
+    auto effective_rsi = seed_data_pointers && seed[Reg::RSI] == 0 ? data_base : seed[Reg::RSI];
 
     g_engine               = std::make_unique<Engine>();
     g_engine->base         = (std::uint64_t)code_base;
@@ -1782,7 +1790,8 @@ Trace run_engine(
     trace.seed[Reg::RSI] = effective_rsi;
     trace.seed[Reg::RIP] = g_engine->base;
 
-    // User status flags + reserved bit 1 + IF. No TF here. This is the displayed baseline, not the stepping context.
+    // User status flags + reserved bit 1 + IF.
+    // No TF here. This is the displayed baseline, not the stepping context.
     trace.seed[Reg::RFLAGS] = (seed[Reg::RFLAGS] & RFLAGS_STATUS_MASK) | RFLAGS_RESERVED_BIT1 | RFLAGS_INTERRUPT_FLAG;
 
     auto thread = CreateThread(nullptr, 0, sandbox_thread_main, nullptr, CREATE_SUSPENDED, nullptr);
@@ -1861,6 +1870,7 @@ Trace run_engine(
         if ((seed.fpu_tag_word_abridged >> i & 1) != 0)
         {
             trace.seed.st[i] = seed.st[i];
+
             std::memcpy(&context.FltSave.FloatRegisters[i], seed.st[i].data(), seed.st[i].size());
 
             context.FltSave.TagWord |= (std::uint8_t)(1 << i);
@@ -2038,7 +2048,7 @@ void redisasm(Trace &trace, DisasmBackend backend, DisasmSyntax syntax) noexcept
 
 struct UI
 {
-    // Input. Bytes, per-register seeds and disassembly syntax.
+    // Input.
     std::string                    code{};                           // Hex byte input.
     DisasmBackend                  backend   = DisasmBackend::Zydis; // Active decode backend (Zydis default).
     DisasmSyntax                   syntax    = DisasmSyntax::Intel;  // Active disassembly syntax (Intel default).
@@ -2344,6 +2354,7 @@ void restore_history_selection(UI &ui, const HistorySelection &selection) noexce
     for (std::size_t i{}; i < steps.size(); ++i)
     {
         auto &step = steps[i];
+
         if (selection.reached)
         {
             if (step.reached && step.execution_position == selection.execution_position)
@@ -2473,8 +2484,8 @@ std::int32_t run_tui(const CLI &cli)
             return;
         }
 
-        // Malformed seed text is lenient here (unlike --seed's hard error at CLI parse time). The run still proceeds with that field left unseeded,
-        // and the reason is appended to the status line instead of being silently discarded.
+        // Malformed seed text is lenient here (unlike --seed's hard error at CLI parse time).
+        // The run still proceeds with that field left unseeded, and the reason is appended to the status line instead of being silently discarded.
         std::vector<std::string> seed_errors{};
         auto                     seed = compose_seed(ui.seed_gpr, ui.seed_flags, ui.seed_xmm, ui.seed_st, seed_errors);
 
@@ -2491,7 +2502,8 @@ std::int32_t run_tui(const CLI &cli)
         }
     };
 
-    // Advance to the next completed instruction or partial fault state. Not-reached rows stay browsable through the history menu.
+    // Advance to the next completed instruction or partial fault state.
+    // Not-reached rows stay browsable through the history menu.
     auto step = [&ui]() noexcept
     {
         auto &steps = history_steps_at(ui, ui.history_tab);
@@ -2624,7 +2636,8 @@ std::int32_t run_tui(const CLI &cli)
 
     for (std::size_t i{}; i < GPR_COUNT; ++i)
     {
-        // RSP is engine-controlled (always reset to the scratch-stack top). No seed input.
+        // RSP is engine-controlled (always reset to the scratch-stack top).
+        // No seed input.
         if (i == (std::size_t)Reg::RSP)
         {
             continue;
@@ -2655,8 +2668,8 @@ std::int32_t run_tui(const CLI &cli)
     auto seed_selected  = (std::int32_t)seed_components.size() - 1;
     auto seed_container = ftxui::Container::Vertical(seed_components, &seed_selected);
 
-    // Seed inputs for the SSE and x87 panels. One text input per register, composed on run. Each panel gets
-    // its own `InputOption` so `on_enter` can target that panel's own `FocusSink`.
+    // SSE/x87 seed inputs, one per register, are composed on run.
+    // Separate `InputOption`s let `on_enter` target each panel's `FocusSink`.
     auto xmm_focus_sink = make_focus_sink();
 
     ftxui::InputOption xmm_seed_option{};
@@ -2703,7 +2716,8 @@ std::int32_t run_tui(const CLI &cli)
     auto back_button  = ftxui::Button("Back", back, ftxui::ButtonOption::Ascii());
     auto reset_button = ftxui::Button("Reset", reset, ftxui::ButtonOption::Ascii());
 
-    // Cycling buttons. Left-click advances, right-click (within the button's reflected box) steps back.
+    // Cycling buttons.
+    // Left-click advances, right-click (within the button's reflected box) steps back.
     ftxui::Box syntax_button_box{};
     ftxui::Box backend_button_box{};
 
@@ -2899,8 +2913,8 @@ std::int32_t run_tui(const CLI &cli)
             auto full  = current[reg];
             auto prev  = previous[reg];
 
-            // Emit one tree node. Levels 0..2 are expandable (clickable).
-            // Level 3 (8-bit) is a leaf.
+            // Emit one tree node.
+            // Levels 0..2 expand on click, level 3 is a leaf.
             auto emit = [&](std::int32_t level, std::string_view sub_name, std::uint64_t value, std::uint64_t prev_value, std::int32_t hex_digits,
                             const ftxui::Component &seed_component)
             {
@@ -2950,7 +2964,8 @@ std::int32_t run_tui(const CLI &cli)
         return table.Render();
     };
 
-    // Clickable flag tokens. Filled during render, hit-tested on click to toggle that seed flag.
+    // Clickable flag tokens.
+    // Filled during render, hit-tested on click to toggle that seed flag.
     struct FlagHit
     {
         ftxui::Box    box{};
@@ -3137,8 +3152,8 @@ std::int32_t run_tui(const CLI &cli)
         st_hits.clear();
         st_hits.reserve(current.st.size());
 
-        // Raw storage is always copyable. Decimal values are copyable only while their x87 tag is occupied.
-        // Reserve up to 3 targets per ST register so `ftxui::reflect()` box refs stay stable.
+        // Raw storage is always copyable, decimal values require an occupied x87 tag.
+        // Reserve 3 targets per ST so `ftxui::reflect()` box refs stay stable.
         copy_hits.clear();
         copy_hits.reserve(current.st.size() * 3);
 
@@ -3392,7 +3407,8 @@ std::int32_t run_tui(const CLI &cli)
     });
     auto data_addr = fmt::format("0x{:016X}", scratch_reserve_base() + g_page_size);
 
-    // Clickable Data-address region. A left-click copies it to the clipboard.
+    // Clickable Data-address region.
+    // A left-click copies it to the clipboard.
     ftxui::Box data_box{};
 
     auto layout = ftxui::Renderer(

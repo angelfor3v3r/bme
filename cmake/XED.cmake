@@ -8,7 +8,8 @@ if (CMAKE_CONFIGURATION_TYPES)
     message(FATAL_ERROR "Intel XED currently requires a single-config generator. Use Ninja with an explicit CMAKE_BUILD_TYPE.")
 endif ()
 
-# Download-only. XED has no CMakeLists to add_subdirectory, we just need the sources.
+# Download-only.
+# XED has no CMakeLists to add_subdirectory, we just need the sources.
 CPMAddPackage(URI "gh:intelxed/xed#0bcb6237345c5066726dcc08b3d87928df3b5b26" DOWNLOAD_ONLY YES) # v2026.08.23
 CPMAddPackage(URI "gh:intelxed/mbuild#1b437e409221a2b5703b4d8896baa20d43e4ba1a" DOWNLOAD_ONLY YES) # v2026.08.23
 
@@ -29,8 +30,8 @@ set(XED_KIT "${CMAKE_BINARY_DIR}/xed-kit")
 set(XED_INCLUDE_DIR "${XED_KIT}/include")
 set(XED_LIBRARY "${XED_KIT}/lib/xed.lib") # mbuild `ms` static-lib name
 
-# Match bme's static CRT. `--no-mscrt` drops mbuild's implicit CRT flag so our explicit /MT (Debug /MTd) is the only
-# one. Revisit this if the final link reports a CRT mismatch.
+# Match bme's static CRT.
+# `--no-mscrt` drops mbuild's implicit CRT flag so our explicit /MT (Debug /MTd) is the only one.
 set(XED_RUNTIME_FLAG "/MT")
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(XED_RUNTIME_FLAG "/MTd")
@@ -60,8 +61,9 @@ ExternalProject_Add(xed_build
     BUILD_BYPRODUCTS "${XED_LIBRARY}"
     USES_TERMINAL_BUILD TRUE)
 
-# IMPORTED target. Include dirs from IMPORTED targets are treated as SYSTEM automatically, so XED's
-# headers never trip our -Werror. The include dir must exist at configure time.
+# IMPORTED target.
+# Include dirs from IMPORTED targets are treated as SYSTEM automatically, so XED's headers never trip our -Werror.
+# The include dir must exist at configure time.
 file(MAKE_DIRECTORY "${XED_INCLUDE_DIR}")
 add_library(xed STATIC IMPORTED GLOBAL)
 set_target_properties(xed PROPERTIES
