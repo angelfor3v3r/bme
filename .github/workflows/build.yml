@@ -1,0 +1,86 @@
+name: build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+jobs:
+  format:
+    name: clang-format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install clang-format 22
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm.sh | sudo bash -s 22
+          sudo apt-get install -y clang-format-22
+
+      - name: Check formatting
+        run: |
+          mapfile -t files < <(find src test -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' -o -name '*.h' -o -name '*.hh' -o -name '*.hpp' -o -name '*.hxx' -o -name '*.cppm' \))
+          clang-format-22 --dry-run --Werror -style=file "${files[@]}"
+
+  build:
+    name: windows x86-64 clang
+    needs: format
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Install Clang 22 and NASM
+        run: |
+          choco upgrade llvm --version=22.1.0 -y --no-progress --allow-downgrade
+          choco install ninja nasm -y --no-progress
+          echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
+      - name: Ensure Python is available (XED's `mfile.py` build needs it)
+        id: python_check
+        shell: pwsh
+        run: |
+          if (Get-Command python -ErrorAction SilentlyContinue) {
+            python --version
+            "install=false" >> $env:GITHUB_OUTPUT
+          } else {
+            "install=true" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Set up Python
+        if: steps.python_check.outputs.install == 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBME_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: bme
+          path: build/bme.exe
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          prerelease: ${{ contains(github.ref, '-pre') }}
+          files: build/bme.exe

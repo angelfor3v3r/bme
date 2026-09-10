@@ -1,0 +1,6 @@
+#pragma once
+
+// Generated from `cmake/bme_version.hpp.in` by `cmake/GenerateVersion.cmake`. Do not edit.
+#define BME_GIT_TAG  "@BME_GIT_TAG@"
+#define BME_GIT_HASH "@BME_GIT_HASH@"
+#define BME_GIT_URL  "@BME_GIT_URL@"

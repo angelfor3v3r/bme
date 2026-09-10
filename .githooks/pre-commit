@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+
+# Reject commits whose staged C/C++ changes aren't clang-format clean.
+# Checks the *staged* content only. Never edits your working tree or re-stages anything.
+set -euo pipefail
+
+# Gather staged C/C++ files from the index. `< <(...)` (not a pipe) keeps the loop
+# in this shell so the array survives, and avoids `mapfile` (which needs bash 4+).
+files=()
+while IFS= read -r f; do
+    files+=("$f")
+done < <(git diff --cached --name-only --diff-filter=ACMR -- \
+    '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hh' '*.hpp' '*.hxx' '*.cppm')
+
+# Nothing C/C++ staged -> don't even require clang-format, so let the commit through.
+[ ${#files[@]} -eq 0 ] && exit 0
+
+command -v clang-format >/dev/null || {
+    echo "pre-commit: clang-format not found on PATH" >&2
+    exit 1
+}
+
+# Warn (don't block) when the local clang-format major differs from CI's.
+version=$(clang-format --version | sed -n 's/.*version \([0-9][0-9]*\).*/\1/p')
+if [ "$version" != "22" ]; then
+    echo "pre-commit: warning - CI uses clang-format 22; found $(clang-format --version)" >&2
+fi
+
+# Compare each staged file against its formatted form (index content, not the worktree).
+bad=()
+for f in "${files[@]}"; do
+    if ! diff -q <(git show ":$f") <(git show ":$f" | clang-format -style=file --assume-filename="$f") >/dev/null 2>&1; then
+        bad+=("$f")
+    fi
+done
+
+[ ${#bad[@]} -eq 0 ] && exit 0
+
+echo "pre-commit: staged changes are not clang-format clean:" >&2
+printf '  %s\n' "${bad[@]}" >&2
+echo "Fix: clang-format -i -style=file ${bad[*]}   (then 'git add' them)" >&2
+exit 1
