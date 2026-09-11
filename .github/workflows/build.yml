@@ -95,12 +95,16 @@ jobs:
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
             apt-get install -y ca-certificates curl git ninja-build python3 python3-pip dpkg-dev file build-essential lsb-release software-properties-common
+            git config --global --add safe.directory /src
             curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
             bash /tmp/llvm.sh 22
             apt-get install -y clang-22 lld-22
             python3 -m pip install --break-system-packages cmake==3.31.6
             cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 -DBME_BUILD_TESTS=ON
             cmake --build build --parallel
+            version_output=$(./build/bme --version)
+            printf '%s\n' "$version_output"
+            [[ "$version_output" != *unknown* ]]
             ctest --test-dir build --output-on-failure
             ./build/bme --bytes 48FFC0 --quick --seed rax=64
             cpack --config build/CPackConfig.cmake -G DEB -B build/package
