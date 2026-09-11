@@ -1,22 +1,26 @@
 # Third-Party Licenses
 
-The `bme` binary statically links the open-source libraries listed below. Their
+The `bme` binary includes code from or statically links the open-source libraries listed below. Their
 copyright notices and license texts are reproduced here verbatim from each
 project's pinned source, as required by their licenses. Each library remains
 under its own license; BME itself is MIT-licensed (see [LICENSE](LICENSE)).
 
-[CPM.cmake](https://github.com/cpm-cmake/CPM.cmake) (MIT) fetches these
-dependencies at build time but is not part of the distributed binary.
+The following build and test tools are not part of the distributed `bme` binary.
 
-| Library | Role | License |
-| --- | --- | --- |
-| [Zydis](https://github.com/zyantific/zydis) | disassembler backend | MIT |
-| [bddisasm](https://github.com/bitdefender/bddisasm) | disassembler backend | Apache-2.0 |
-| [Capstone](https://github.com/capstone-engine/capstone) | disassembler backend | BSD-3-Clause |
-| [XED](https://github.com/intelxed/xed) | disassembler backend | Apache-2.0 |
-| [FTXUI](https://github.com/ArthurSonzogni/FTXUI) | terminal UI | MIT |
-| [fmt](https://github.com/fmtlib/fmt) | formatting | MIT |
-| [argparse](https://github.com/p-ranav/argparse) | CLI parsing | MIT |
+- [CPM.cmake](https://github.com/cpm-cmake/CPM.cmake) 0.42.3 (MIT) is vendored package-management tooling.
+- [mbuild](https://github.com/intelxed/mbuild) v2026.08.23 (Apache-2.0) is fetched to build XED.
+- [GoogleTest](https://github.com/google/googletest) v1.18.0 (BSD-3-Clause) is fetched only when tests are enabled.
+
+| Library                                                 | Role                  | License               |
+|---------------------------------------------------------|-----------------------|-----------------------|
+| [Zydis](https://github.com/zyantific/zydis)             | disassembler backend  | MIT                   |
+| [Zycore](https://github.com/zyantific/zycore-c)         | Zydis support library | MIT                   |
+| [bddisasm](https://github.com/bitdefender/bddisasm)     | disassembler backend  | Apache-2.0            |
+| [Capstone](https://github.com/capstone-engine/capstone) | disassembler backend  | BSD-3-Clause and NCSA |
+| [XED](https://github.com/intelxed/xed)                  | disassembler backend  | Apache-2.0            |
+| [FTXUI](https://github.com/ArthurSonzogni/FTXUI)        | terminal UI           | MIT                   |
+| [fmt](https://github.com/fmtlib/fmt)                    | formatting            | MIT                   |
+| [argparse](https://github.com/p-ranav/argparse)         | CLI parsing           | MIT                   |
 
 ---
 
@@ -30,6 +34,38 @@ The MIT License (MIT)
 
 Copyright (c) 2014-2024 Florian Bernd
 Copyright (c) 2014-2024 Joel Höner
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
+## Zycore
+
+- Homepage: <https://github.com/zyantific/zycore-c>
+- SPDX-License-Identifier: MIT
+
+```
+The MIT License (MIT)
+
+Copyright (c) 2018-2024 Florian Bernd
+Copyright (c) 2018-2024 Joel Höner
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -300,6 +336,87 @@ INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
 CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.
+```
+
+---
+
+## Capstone LLVM-derived code
+
+- Homepage: <https://github.com/capstone-engine/capstone>
+- SPDX-License-Identifier: NCSA
+
+```
+==============================================================================
+LLVM Release License
+==============================================================================
+University of Illinois/NCSA
+Open Source License
+
+Copyright (c) 2003-2013 University of Illinois at Urbana-Champaign.
+All rights reserved.
+
+Developed by:
+
+    LLVM Team
+
+    University of Illinois at Urbana-Champaign
+
+    http://llvm.org
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal with
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+    * Redistributions of source code must retain the above copyright notice,
+      this list of conditions and the following disclaimers.
+
+    * Redistributions in binary form must reproduce the above copyright notice,
+      this list of conditions and the following disclaimers in the
+      documentation and/or other materials provided with the distribution.
+
+    * Neither the names of the LLVM Team, University of Illinois at
+      Urbana-Champaign, nor the names of its contributors may be used to
+      endorse or promote products derived from this Software without specific
+      prior written permission.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH THE
+SOFTWARE.
+
+==============================================================================
+Copyrights and Licenses for Third Party Software Distributed with LLVM:
+==============================================================================
+The LLVM software contains code written by third parties.  Such software will
+have its own individual LICENSE.TXT file in the directory in which it appears.
+This file will describe the copyrights, license, and restrictions which apply
+to that code.
+
+The disclaimer of warranty in the University of Illinois Open Source License
+applies to all code in the LLVM Distribution, and nothing in any of the
+other licenses gives permission to use the names of the LLVM Team or the
+University of Illinois to endorse or promote products derived from this
+Software.
+
+The following pieces of software have additional or alternate copyrights,
+licenses, and/or restrictions:
+
+Program             Directory
+-------             ---------
+Autoconf            llvm/autoconf
+                    llvm/projects/ModuleMaker/autoconf
+                    llvm/projects/sample/autoconf
+Google Test         llvm/utils/unittest/googletest
+OpenBSD regex       llvm/lib/Support/{reg*, COPYRIGHT.regex}
+pyyaml tests        llvm/test/YAMLParser/{*.data, LICENSE.TXT}
+ARM contributions   llvm/lib/Target/ARM/LICENSE.TXT
+md5 contributions   llvm/lib/Support/MD5.cpp llvm/include/llvm/Support/MD5.h
 ```
 
 ---
