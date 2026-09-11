@@ -94,7 +94,7 @@ jobs:
             set -eux
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
-            apt-get install -y ca-certificates curl git ninja-build python3 python3-pip dpkg-dev build-essential
+            apt-get install -y ca-certificates curl git ninja-build python3 python3-pip dpkg-dev build-essential lsb-release software-properties-common
             curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
             bash /tmp/llvm.sh 22
             apt-get install -y clang-22 lld-22
