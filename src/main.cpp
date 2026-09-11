@@ -1,6 +1,9 @@
+#include "bme_core.hpp"
+
 #include <fmt/format.h>
 
-#include "bme_core.hpp"
+#include <cstdint>
+#include <cstdio>
 
 std::int32_t main(std::int32_t argc, char *argv[], [[maybe_unused]] char *envp[])
 {

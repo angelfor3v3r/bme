@@ -3,8 +3,8 @@
 ## What this is
 
 **BME** - a bare-metal x86-64 machine-code viewer / mini step-debugger TUI.
-Paste raw bytes (e.g. `48ffc0`), run them in an in-process sandbox, and watch
-GPRs, RFLAGS, XMM, and x87 state change one instruction at a time.
+Paste raw bytes (e.g. `48ffc0`), run them in BME's sandbox, and watch GPRs,
+RFLAGS, XMM, and x87 state change one instruction at a time.
 
 - **Goal** - Differential analysis, and the real reason BME exists, is finding
   where x86 *decoders* and the *actual CPU* diverge. A disassembler only maps bytes to a mnemonic. It
@@ -13,28 +13,28 @@ GPRs, RFLAGS, XMM, and x87 state change one instruction at a time.
   check whose outcome depends on the live descriptor tables and current privilege level can't be
   resolved statically), and some encodings have generation-specific meanings, so identical bytes can
   represent different instructions on different processors.
-- **Platform** - Windows only, x86-64 only. CMake hard-errors otherwise.
-- **Sandbox model** - `VirtualAlloc` a buffer, write the bytes, mark RX, then
-  single-step via a Vectored Exception Handler (trap flag). Each step records
-  register state *after* the instruction. Faults / `int3` / runaway loops are
-  contained and surfaced in the UI rather than crashing the process.
+- **Platform** - Windows and Linux, x86-64 only. CMake hard-errors otherwise.
+- **Sandbox model** - Windows reserves guarded mappings and single-steps a sandbox thread with a Vectored Exception Handler. Linux reserves the same mappings in a traced child and uses `PTRACE_SINGLESTEP`. Both capture GPR, RFLAGS, XMM, and x87 state after each completed instruction. Faults, `int3`, and runaway loops are contained and surfaced in the UI rather than crashing the host.
 - Decode is pluggable (`DisasmBackend`) - **Zydis** (default), **bddisasm**, **Capstone**, or **XED**. TUI via FTXUI, CLI via argparse, formatting via fmt.
-- x87 80-bit conversions run on the FPU via three tiny MASM leaves in `src/st80.asm`
-  (`st80_to_double`, `double_to_st80`, and `st80_to_float`, Win64 ABI, built as the `bme_asm` OBJECT library).
+- x87 80-bit conversions run on the FPU via three small assembly leaves. Windows uses `src/st80.asm` with the Win64 ABI. Linux uses `src/st80.S` with the SysV x86-64 ABI. Both build as the `bme_asm` OBJECT library.
 
 ## Layout
 
 ```
 src/bme_core.hpp     # public library API (namespace bme). Types, enums, parse/compose/engine/decode prototypes
-src/bme_core.cpp     # library implementation (namespace bme). All logic except main
+src/bme_core.cpp     # platform-neutral library logic and TUI
+src/os.hpp           # private VM, environment, clipboard, and stepping contract
+src/os.windows.cpp   # Windows VM, VEH, clipboard, environment, and stepping implementation
+src/os.linux.cpp     # Linux mmap, ptrace, terminal clipboard, environment, and stepping implementation
 src/main.cpp         # thin entry. Parses args, calls bme::init then run_quick / run_tui
-src/st80.asm         # x87 80-bit <-> double and -> float, on-FPU (MASM, win64)
+src/st80.asm         # x87 80-bit conversion leaves for Win64 MASM
+src/st80.S           # x87 80-bit conversion leaves for SysV GNU assembler
 test/                # GoogleTest suite for the headless path (links bme_core), built with -DBME_BUILD_TESTS=ON
-CMakeLists.txt       # CPM deps, version-gen, warning policy
+CMakeLists.txt       # CPM deps, platform targets, version generation, CPack, warning policy
 cmake/GenerateVersion.cmake + bme_version.hpp.in   # --version git tag/hash/url -> generated header
 cmake/XED.cmake      # Intel XED backend - CPM download + mfile.py build via ExternalProject
 .githooks/pre-commit # rejects unformatted commits (diffs staged content against clang-format, warns if the local major version is not 22)
-.github/workflows/   # CI runs clang-format check + Windows clang->MSVC build
+.github/workflows/   # CI runs clang-format plus Windows and Debian 12 builds
 .clang-format        # the authoritative style (clang-format 22)
 third_party/cmake/   # CPM.cmake
 ```
@@ -43,10 +43,17 @@ Build dirs (`cmake-build-*`, `build-clang`) are local/gitignored.
 
 ## Build
 
-Windows, Ninja + MASM. Primary/CI toolchain is **clang++ targeting MSVC** (GNU driver). **clang-cl** and **MSVC cl** also build (they ride the MSVC flag path).
+Windows uses Ninja, MASM, and **clang++ targeting MSVC**. **clang-cl** and **MSVC cl** also build through the MSVC ABI path.
 
 ```sh
 cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build build
+```
+
+Linux uses Ninja and a C++23 compiler. Debian 12 with Clang 22 is the CI and packaging baseline. GCC 12 or newer is supported.
+
+```sh
+cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22
 cmake --build build
 ```
 
@@ -56,7 +63,7 @@ headers stay out of `-Werror`. Intel XED (`v2026.08.23` plus its mbuild) has no 
 downloads it and an ExternalProject builds it via `mfile.py` (`cmake/XED.cmake`) - needs Python 3.
 All slow on first configure.
 
-- C++23. clang++ warns with `-Wall -Wextra -Wshadow -Wpedantic`. clang-cl / MSVC cl use `/W4 /permissive-`. Codegen is pinned to baseline **x86-64** (SSE2, no AVX - `-march=x86-64`, or cl's immutable x64 default) so `bme` runs on any x86-64 CPU.
+- C++23. Clang and GCC warn with `-Wall -Wextra -Wshadow -Wpedantic`. clang-cl / MSVC cl use `/W4 /permissive-`. Codegen is pinned to baseline **x86-64** (SSE2, no AVX - `-march=x86-64`, or cl's immutable x64 default) so `bme` runs on any x86-64 CPU.
 - `-Werror` / `/WX` only when `CI` env var is set (toolchain pinned there).
   Locally you see warnings but they don't block.
 - **The user compiles and runs themselves.** Do NOT kick off full CMake
@@ -69,7 +76,7 @@ All slow on first configure.
 Off by default. Configure with `-DBME_BUILD_TESTS=ON` to fetch GoogleTest (CPM) and build `bme_tests`, then run `ctest`.
 
 ```sh
-cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBME_BUILD_TESTS=ON
+cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 -DBME_BUILD_TESTS=ON
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
@@ -113,7 +120,7 @@ clang-format config is settled (clang-format 22, tweaked with braced-list breaki
 function-arg vertical compounding, `NumericLiteralCase`
 lower/upper/lower/lower, binary-op breaking `NonAssignment`/`OnePerLine`).
 Don't reformat by hand - the pre-commit hook + CI enforce it.
-Never run clang-format on `src/st80.asm`. clang-format does not support MASM.
+Never run clang-format on `src/st80.asm` or `src/st80.S`.
 
 ## Key internals (src/bme_core.cpp)
 
@@ -126,11 +133,9 @@ Never run clang-format on `src/st80.asm`. clang-format does not support MASM.
   marks static disassembly that never executed. `data` identifies raw "(data)" bytes.
 - `Trace` - seed, steps, `Outcome` (Idle/Finished/Faulted/AbortedCap/Stopped), `message` (status
   summary), `stop_reason` + `stop_address` (labels the int3/fault stop instruction).
-- `Engine` - VirtualAlloc/VEH sandbox. Pre-reserves step vector so the trap path
-  is allocation-free (a wild `mov [addr],reg` can corrupt the heap - never
-  realloc inside the VEH). 64 KiB scratch stack + a 64 KiB scratch data region (`SCRATCH_DATA_BYTES`, guard pages both sides) reserved at the fixed `SCRATCH_DATA_BASE` (shown in the header) so any seed or `[mem]` can target it. RDI/RSI default there unless seeded (they're x86's string-op source/dest pointers, so `movs`/`stos`/`rep` snippets just work). Step cap `ui.max_steps` (default 50k, via `--max-steps`/Settings, clamped to `MAX_STEPS_LIMIT`).
-- `parse_hex` (`std::from_chars`, `Result`/`std::expected`-based),
-  `parse_seed`, `fault_name`.
+- Platform execution lives behind the private `os.hpp` contract. Windows uses guarded `VirtualAlloc` mappings and a VEH sandbox thread. Linux uses guarded `mmap` mappings and a traced child with `PTRACE_SINGLESTEP` plus `PTRACE_GETFPREGS` for XMM and x87 state. The 64 KiB scratch stack and 64 KiB data region have guard pages. The data mapping reserves at `SCRATCH_DATA_RESERVE_BASE`, never relocates, and exposes usable bytes one guard page above it. RDI and RSI default to that usable address unless seeded. Step cap `ui.max_steps` defaults to 50k and clamps to `MAX_STEPS_LIMIT`.
+- Linux asks Zydis to identify software-breakpoint instructions only after ptrace reports a breakpoint-class `SIGTRAP`. This avoids handwritten x86 parsing and distinguishes WSL2's ambiguous syscall completion trap. The runtime check does not use the selected display backend.
+- `parse_hex` (`std::from_chars`, `Result`/`std::expected`-based), `parse_seed`.
 - Decode backends (`DisasmBackend`). `disasm_one(backend, syntax, addr, code, size)` -> `Decoded`
   (`ok`/`text`/`length`), dispatching to **Zydis** (Intel + AT&T), **bddisasm** (Intel only), **Capstone** (Intel + AT&T), or **XED** (Intel + AT&T),
   gated by `backend_supports`, which reads the per-decoder `BACKENDS` capability table. `run_engine`/`redisasm` thread the backend through. The goal is
@@ -195,7 +200,7 @@ Never run clang-format on `src/st80.asm`. clang-format does not support MASM.
     `st_seed_components`, `Focusable() == false` so arrow-key `MoveSelector` can never land on it, but
     `TakeFocus()` doesn't check `Focusable()` so it can still be targeted explicitly) gives
     `register_has_real_focus` a cheap, purely local signal to check per tab (`!gpr_focus_sink->Active()`
-    etc). Each seed container is built with an explicit external `int` selector defaulting to the sink's
+    etc.). Each seed container is built with an explicit external `int` selector defaulting to the sink's
     index (not 0), so no real `Input` is active at startup. Clicking an `Input` still claims the slot
     normally (`Input::OnEvent` calls `TakeFocus()`), flipping `register_has_real_focus` true.
     `defocus_current_register_tab` reverses that (`TakeFocus()` on the sink for whichever register tab is

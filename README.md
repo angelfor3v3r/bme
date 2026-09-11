@@ -26,12 +26,12 @@ decoders can disagree on the same bytes. Executing on real silicon (and swapping
 - Reports where and why a run stopped (fault, `int3`, or step cap), and marks skipped code not-reached
 - Seed status flags too - click any flag in the Flags panel (CF/PF/AF/ZF/SF/OF/DF)
 - Seed XMM and x87 `ST(i)` registers too, as raw hex or a decimal value (`1.5`, optional `f`/`l` precision suffix), from the SSE / x87 panels or `--seed`
-- Scratch data buffer at a fixed address (shown in the header, click to copy). RDI and RSI point at it by default (toggle in Settings), or seed any register with it
+- Scratch data buffer one guard page above a fixed reservation. The TUI shows its usable address, which RDI and RSI receive by default (toggle in Settings), or seed any register with it
 - Click any register value (GPR, XMM, MXCSR, x87, or an individual float in a drill-down) to copy it to the clipboard
 - Keyboard shortcuts. **F5** run, **F8** step, **F7** back
 - Headless `--quick` dump - print the trace (per-instruction register deltas) to stdout, no TUI
-- Detects Intel SDE and Pin instrumentation from environment markers, parent processes, or loaded modules, and refuses native single-step tracing with a warning
-- History panel has a tab per decoder (`History (Zydis)`, `History (bddisasm)`, ...) next to `History (Main)`. Each backend applies its own instruction boundaries to the original bytes without re-running the code
+- Detects Intel SDE and Pin instrumentation from environment markers. Windows also checks parent processes and loaded modules
+- History panel has a `Main` tab plus one tab per decoder (`zydis`, `bddisasm`, `capstone`, `xed`). Each backend applies its own instruction boundaries to the original bytes without re-running the code
 
 ## Usage
 
@@ -51,10 +51,12 @@ bme --bytes 48FFC0                       # preload "inc rax", ready to run
 bme --bytes 48FFC0 --run                 # preload and run on launch
 bme --bytes 48C7C001000000 --syntax att  # preload "mov rax, 1", AT&T syntax
 bme --bytes 48FFC0 --backend bddisasm    # decode with bddisasm instead of Zydis
+bme --version                            # print build version information
 ```
 
 - `--bytes <hex>` - x86-64 machine code as hex (whitespace allowed)
-- `--run` - run immediately on launch (needs `--bytes`)
+- `--run` - run immediately when `--bytes` is supplied. Otherwise open the TUI normally
+- `--version` - print the build tag, commit hash, and repository URL
 - `--syntax intel|att` - disassembly syntax (default `intel`)
 - `--backend zydis|bddisasm|capstone|xed` - x86 decoder backend (default `zydis`, bddisasm is Intel-only)
 - `--max-steps N` - instruction cap before a run aborts (default `50000`)
@@ -71,18 +73,39 @@ bme --bytes D8C1 --quick --track x87 --seed st0=2.0,st1=3.0  # fadd st0, st1 -> 
 
 ## Build
 
-Windows, Clang (MSVC target), with Ninja + MASM. Python 3 is needed to build the bundled XED backend.
+BME supports native x86-64 Windows and Linux. Python 3 is needed to build the bundled XED backend.
+
+### Windows
+
+Use Ninja, MASM, and Clang targeting the MSVC ABI.
 
 ```sh
 cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 cmake --build build
 ```
 
-Prebuilt binaries are on the [Releases](https://github.com/angelfor3v3r/bme/releases) page.
+### Linux
+
+Use Ninja and a C++23 compiler. CI builds a Debian 12 package with Clang 22. GCC 12 or newer also works.
+
+```sh
+cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22
+cmake --build build
+```
+
+Prebuilt binaries and packages are on the [Releases](https://github.com/angelfor3v3r/bme/releases) page.
+
+## Packages
+
+CPack generates a Debian package plus a `.tar.gz` archive on Linux.
+
+```sh
+cpack --config build/CPackConfig.cmake
+```
 
 ## Tests
 
-Unit tests cover BME-owned behavior including parsing, seed composition, CLI handling, environment handling, bounded engine execution, fault-state capture, and `--quick` errors. Decoder correctness and x87 assembly remain outside the unit-test contract. Off by default.
+Unit tests cover BME-owned behavior including parsing, seed composition, CLI handling, environment handling, bounded engine execution, fault-state capture, and `--quick` errors. Decoder correctness remains outside the unit-test contract. Off by default.
 
 ```sh
 cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBME_BUILD_TESTS=ON

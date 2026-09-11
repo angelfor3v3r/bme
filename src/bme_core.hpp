@@ -16,9 +16,6 @@ namespace bme
 template <class T, class E>
 using Result = std::expected<T, E>;
 
-template <class E>
-using Error = std::unexpected<E>;
-
 constexpr std::size_t DEFAULT_MAX_STEPS = 50'000;    // Default single-step cap (override via `--max-steps` / Settings).
 constexpr std::size_t MAX_STEPS_LIMIT   = 1'000'000; // Hard ceiling. The trap path pre-reserves this many steps, so it bounds memory.
 
@@ -177,29 +174,22 @@ struct Trace
     std::uint64_t stop_address{};      // Address of the stop instruction (int3/fault), 0 otherwise.
 };
 
-// A backend-agnostic decode result.
-// The disassembly text and the instruction's byte length.
-struct Decoded
-{
-    std::string text{};
-    std::size_t length{};
-
-    [[nodiscard]] bool valid() const noexcept { return !text.empty() && length != 0; }
-
-    explicit operator bool() const noexcept { return valid(); }
-};
-
 struct CLI
 {
     static Result<CLI, std::string> parse(std::int32_t argc, char *argv[]);
 
-    std::optional<std::string>     bytes{};
-    bool                           run{};
-    bool                           quick{};
-    DisasmSyntax                   syntax    = DisasmSyntax::Intel;
-    DisasmBackend                  backend   = DisasmBackend::Zydis;
-    std::size_t                    max_steps = DEFAULT_MAX_STEPS;
-    TrackMask                      track{};
+    // Invocation.
+    std::optional<std::string> bytes{};
+    bool                       run{};
+    bool                       quick{};
+
+    // Run settings.
+    DisasmSyntax  syntax    = DisasmSyntax::Intel;
+    DisasmBackend backend   = DisasmBackend::Zydis;
+    std::size_t   max_steps = DEFAULT_MAX_STEPS;
+    TrackMask     track{};
+
+    // Initial state.
     std::array<GPRSeed, GPR_COUNT> seed_gpr{};
     std::uint64_t                  seed_flags{};
     std::array<std::string, 16>    seed_xmm{};
@@ -215,9 +205,8 @@ Result<std::uint64_t, std::string>                parse_seed(std::string_view se
 Result<DecimalSeed, std::string>                  parse_decimal_seed(std::string_view text, std::string_view label);
 Result<std::array<std::uint64_t, 2>, std::string> compose_xmm_seed(const std::string &text);
 Result<std::array<std::uint8_t, 10>, std::string> compose_st_seed(const std::string &text);
-
-std::uint64_t compose_gpr_seed(const GPRSeed &seed, std::string_view label, std::vector<std::string> &errors);
-Registers     compose_seed(
+std::uint64_t                                     compose_gpr_seed(const GPRSeed &seed, std::string_view label, std::vector<std::string> &errors);
+Registers                                         compose_seed(
     const std::array<GPRSeed, GPR_COUNT> &seed_gpr,
     std::uint64_t                         seed_flags,
     const std::array<std::string, 16>    &seed_xmm,
@@ -225,13 +214,13 @@ Registers     compose_seed(
     std::vector<std::string>             &errors
 );
 
-Decoded disasm_one(DisasmBackend backend, DisasmSyntax syntax, std::uint64_t address, const std::uint8_t *code, std::size_t size) noexcept;
-
 // Process-global engine access is serialized.
 // Do not call recursively.
 Trace run_engine(
     std::span<std::uint8_t> code, const Registers &seed, std::size_t max_steps, DisasmBackend backend, DisasmSyntax syntax, bool seed_data_pointers
 );
+
+void redisasm(Trace &trace, DisasmBackend backend, DisasmSyntax syntax) noexcept;
 
 std::int32_t run_quick(const CLI &cli);
 std::int32_t run_tui(const CLI &cli);
