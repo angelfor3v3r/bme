@@ -146,7 +146,7 @@ CPMAddPackage(URI "gh:capstone-engine/capstone#022575848782a4801fd150fdbc927effc
     "CAPSTONE_INSTALL OFF"
     "CAPSTONE_X86_SUPPORT ON")
 
-# XED builds through mfile.py because it has no native CMake target.
+# XED builds through `mfile.py` because it has no native CMake target.
 include(XED)
 
 # Platform-specific x87 conversion leaves.
@@ -164,7 +164,7 @@ else ()
 endif ()
 
 # Refresh Git metadata before targets build.
-# configure_file rewrites the header only when it changes.
+# `configure_file` rewrites the header only when it changes.
 add_custom_target(bme_version
     BYPRODUCTS "${BME_VERSION_HEADER}"
     COMMAND "${CMAKE_COMMAND}" ${BME_VERSION_ARGS} -P "${BME_VERSION_SCRIPT}"
@@ -211,7 +211,7 @@ function(bme_apply_common_config target)
     add_dependencies(${target} xed_build)
 endfunction()
 
-# Keep warnings off bme_tests so GoogleTest macros cannot trip CI's -Werror.
+# Keep warnings off `bme_tests` so GoogleTest macros cannot trip CI's `-Werror`.
 function(bme_apply_warnings target)
     if (BME_IS_CLANG OR BME_IS_GCC)
         target_compile_options(${target}
@@ -252,9 +252,11 @@ bme_apply_warnings(bme)
 target_link_libraries(bme PRIVATE bme_core)
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES src/bme_core.cpp src/os.cpp ${BME_PLATFORM_SOURCE} src/main.cpp)
 
-# Only the executable is installed. bme_core remains an internal test seam.
+# Install the executable and its license material.
+# `bme_core` remains an internal test seam.
 include(GNUInstallDirs)
 install(TARGETS bme RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+install(FILES LICENSE THIRD_PARTY_LICENSES.md DESTINATION "${CMAKE_INSTALL_DOCDIR}")
 
 # Package native Linux builds as DEB and TGZ.
 if (BME_OS_LINUX)
@@ -262,6 +264,7 @@ if (BME_OS_LINUX)
     set(CPACK_PACKAGE_CONTACT "angelfor3v3r")
     set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Bare-metal x86-64 machine-code viewer")
     set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+    set(CPACK_PACKAGE_FILE_NAME "${PROJECT_NAME}-${PROJECT_VERSION}-linux-x86_64")
     set(CPACK_GENERATOR "DEB;TGZ")
     set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
     set(CPACK_DEBIAN_PACKAGE_MAINTAINER "${CPACK_PACKAGE_CONTACT}")
