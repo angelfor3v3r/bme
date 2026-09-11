@@ -1,7 +1,8 @@
 # Intel XED decoder backend.
 #
-# XED has no native CMake. CPM downloads its sources plus `intelxed/mbuild`, an ExternalProject drives
-# `mfile.py` to build a static `xed`, and we expose it as the IMPORTED target `xed`. Needs Python 3 at build time.
+# XED has no native CMake.
+# CPM downloads its sources plus `intelxed/mbuild`, an ExternalProject drives
+# `mfile.py` to build a static library, and we expose it as the IMPORTED target `xed`. Needs Python 3 at build time.
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 if (CMAKE_CONFIGURATION_TYPES)
@@ -21,42 +22,53 @@ if (XED_JOBS EQUAL 0)
     set(XED_JOBS 4)
 endif ()
 
-# Build XED with MSVC `cl` (mbuild `--compiler=ms`) even for a clang bme, on purpose.
-# mbuild's `ms` path emits `xed.lib`, while its clang path emits GNU-style `libxed.a`, which we'd have to special-case
-# and which links awkwardly on Windows. XED is C, so cl-built objects link cleanly into the clang-built
-# bme (same MSVC ABI). And cl is always on PATH, since the MSVC toolchain is required for the clang-with-MSVC-target
-# build anyway.
 set(XED_KIT "${CMAKE_BINARY_DIR}/xed-kit")
 set(XED_INCLUDE_DIR "${XED_KIT}/include")
-set(XED_LIBRARY "${XED_KIT}/lib/xed.lib") # mbuild `ms` static-lib name
 
-# Match bme's static CRT.
-# `--no-mscrt` drops mbuild's implicit CRT flag so our explicit /MT (Debug /MTd) is the only one.
-set(XED_RUNTIME_FLAG "/MT")
-if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(XED_RUNTIME_FLAG "/MTd")
+if (BME_OS_WINDOWS)
+    # XED is C.
+    # Build it with MSVC so it uses BME's static CRT and MSVC ABI.
+    set(XED_LIBRARY "${XED_KIT}/lib/xed.lib")
+    set(XED_RUNTIME_FLAG "/MT")
+    if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(XED_RUNTIME_FLAG "/MTd")
+    endif ()
+
+    set(XED_BUILD_COMMAND
+        "${CMAKE_COMMAND}" -E env "PYTHONPATH=${mbuild_SOURCE_DIR}"
+        "${Python3_EXECUTABLE}" "${xed_SOURCE_DIR}/mfile.py"
+        "--cc=cl"
+        "--cxx=cl"
+        "--compiler=ms"
+        "--jobs=${XED_JOBS}"
+        --no-mscrt
+        "--extra-ccflags=${XED_RUNTIME_FLAG}"
+        "--extra-cxxflags=${XED_RUNTIME_FLAG}"
+        --no-encoder
+        "--install-dir=${XED_KIT}"
+        install)
+else ()
+    # The GNU mbuild path emits the normal Unix static library.
+    set(XED_LIBRARY "${XED_KIT}/lib/libxed.a")
+    set(XED_BUILD_COMMAND
+        "${CMAKE_COMMAND}" -E env "PYTHONPATH=${mbuild_SOURCE_DIR}"
+        "${Python3_EXECUTABLE}" "${xed_SOURCE_DIR}/mfile.py"
+        "--cc=${CMAKE_C_COMPILER}"
+        "--cxx=${CMAKE_CXX_COMPILER}"
+        "--compiler=gnu"
+        "--jobs=${XED_JOBS}"
+        --no-encoder
+        "--install-dir=${XED_KIT}"
+        install)
 endif ()
 
-# mfile.py finds mbuild via `import mbuild` first, so PYTHONPATH is the clean hook (no sibling-dir dance).
-# `install` assembles a kit. Headers land under include/xed, the static lib under lib/.
-# We only decode and format, so `--no-encoder` skips the encoder for a smaller, faster build.
+# `install` assembles a kit.
+# Headers land under include/xed and the static library under lib/.
 ExternalProject_Add(xed_build
     SOURCE_DIR "${xed_SOURCE_DIR}"
     CONFIGURE_COMMAND ""
     BUILD_IN_SOURCE TRUE
-    BUILD_COMMAND
-    "${CMAKE_COMMAND}" -E env "PYTHONPATH=${mbuild_SOURCE_DIR}"
-    "${Python3_EXECUTABLE}" "${xed_SOURCE_DIR}/mfile.py"
-    "--cc=cl"
-    "--cxx=cl"
-    "--compiler=ms"
-    "--jobs=${XED_JOBS}"
-    --no-mscrt
-    "--extra-ccflags=${XED_RUNTIME_FLAG}"
-    "--extra-cxxflags=${XED_RUNTIME_FLAG}"
-    --no-encoder
-    "--install-dir=${XED_KIT}"
-    install
+    BUILD_COMMAND "${XED_BUILD_COMMAND}"
     INSTALL_COMMAND ""
     BUILD_BYPRODUCTS "${XED_LIBRARY}"
     USES_TERMINAL_BUILD TRUE)

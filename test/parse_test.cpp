@@ -36,11 +36,18 @@ TEST(ParseHex, DanglingNibble) { EXPECT_FALSE(parse_hex("4").has_value()); }
 
 TEST(ParseHex, NonHex) { EXPECT_FALSE(parse_hex("zz").has_value()); }
 
-TEST(ParseHex, Empty)
+TEST(ParseHex, EmptyRejected)
 {
     auto bytes = parse_hex("");
-    ASSERT_TRUE(bytes.has_value());
-    EXPECT_TRUE(bytes->empty());
+    ASSERT_FALSE(bytes.has_value());
+    EXPECT_EQ(bytes.error(), "No code to run");
+}
+
+TEST(ParseHex, WhitespaceOnlyRejected)
+{
+    auto bytes = parse_hex(" \t\n");
+    ASSERT_FALSE(bytes.has_value());
+    EXPECT_EQ(bytes.error(), "No code to run");
 }
 
 TEST(ParseSeed, HexPrefix)

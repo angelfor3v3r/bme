@@ -1,21 +1,21 @@
+#include "common.hpp"
+#include "os.hpp"
+#include "test_helpers.hpp"
+
+#if BME_OS_WINDOWS
 #include <array>
+#else
+#include <cstdlib>
+#endif
+
 #include <cstddef>
 #include <string>
 #include <string_view>
 #include <utility>
 
+#if BME_OS_WINDOWS
 #include <Windows.h>
-
-#include "test_helpers.hpp"
-
-namespace bme
-{
-
-// White-box declarations for the internal instrumentation helpers.
-std::string environment_string(std::string_view name) noexcept;
-bool        environment_present(std::string_view name) noexcept;
-
-} // namespace bme
+#endif
 
 namespace
 {
@@ -25,7 +25,7 @@ class EnvironmentVariableScope
 public:
     explicit EnvironmentVariableScope(std::string name) : m_name{std::move(name)}
     {
-        // Windows caps one environment variable at 32,767 characters including the terminator.
+#if BME_OS_WINDOWS
         std::array<char, 32'768> previous{};
 
         SetLastError(ERROR_SUCCESS);
@@ -61,10 +61,20 @@ public:
             return;
         }
 
-        m_previous.assign(previous.data(), (std::size_t)length);
+        m_previous.assign(previous.data(), length);
 
         m_had_previous = true;
         m_captured     = true;
+#else
+        auto *previous = std::getenv(m_name.c_str());
+        if (previous != nullptr)
+        {
+            m_previous     = previous;
+            m_had_previous = true;
+        }
+
+        m_captured = true;
+#endif
     }
 
     EnvironmentVariableScope(const EnvironmentVariableScope &)             = delete;
@@ -79,6 +89,7 @@ public:
             return;
         }
 
+#if BME_OS_WINDOWS
         auto restored =
             m_had_previous ? SetEnvironmentVariableA(m_name.c_str(), m_previous.c_str()) : SetEnvironmentVariableA(m_name.c_str(), nullptr);
         if (restored == FALSE)
@@ -86,6 +97,13 @@ public:
             auto error = GetLastError();
             ADD_FAILURE() << "SetEnvironmentVariableA failed while restoring with " << error;
         }
+#else
+        auto result = m_had_previous ? setenv(m_name.c_str(), m_previous.c_str(), 1) : unsetenv(m_name.c_str());
+        if (result != 0)
+        {
+            ADD_FAILURE() << "Could not restore the environment variable";
+        }
+#endif
     }
 
     void set(std::string_view value)
@@ -93,24 +111,40 @@ public:
         ASSERT_TRUE(m_captured);
 
         std::string value_text{value};
-        auto        result = SetEnvironmentVariableA(m_name.c_str(), value_text.c_str());
+#if BME_OS_WINDOWS
+        auto result = SetEnvironmentVariableA(m_name.c_str(), value_text.c_str());
         if (result == FALSE)
         {
             auto error = GetLastError();
             ADD_FAILURE() << "SetEnvironmentVariableA failed with " << error;
         }
+#else
+        auto result = setenv(m_name.c_str(), value_text.c_str(), 1);
+        if (result != 0)
+        {
+            ADD_FAILURE() << "Could not set the environment variable";
+        }
+#endif
     }
 
     void clear()
     {
         ASSERT_TRUE(m_captured);
 
+#if BME_OS_WINDOWS
         auto result = SetEnvironmentVariableA(m_name.c_str(), nullptr);
         if (result == FALSE)
         {
             auto error = GetLastError();
             ADD_FAILURE() << "SetEnvironmentVariableA failed while clearing with " << error;
         }
+#else
+        auto result = unsetenv(m_name.c_str());
+        if (result != 0)
+        {
+            ADD_FAILURE() << "Could not clear the environment variable";
+        }
+#endif
     }
 
     [[nodiscard]] std::string_view name() const noexcept { return m_name; }
@@ -134,9 +168,6 @@ TEST(Environment, StringHasExactLengthAndPresenceTracksEmptyValues)
     auto        actual = environment_string(variable_name);
     EXPECT_EQ(actual, expected);
     EXPECT_TRUE(environment_present(variable_name));
-
-    auto required = GetEnvironmentVariableA(variable_name.data(), nullptr, 0);
-    EXPECT_EQ(required, (DWORD)(expected.size() + 1));
 
     variable.set("");
 

@@ -3,6 +3,14 @@
 #include <cstddef>
 #include <string>
 
+TEST(CliParse, RunWithoutBytesIsAllowed)
+{
+    auto cli = parse_cli({"--run"});
+    ASSERT_TRUE(cli.has_value());
+    EXPECT_TRUE(cli->run);
+    EXPECT_FALSE(cli->bytes.has_value());
+}
+
 TEST(CliParse, SeedFullGpr)
 {
     auto cli = parse_cli({"--bytes", "48FFC0", "--seed", "rax=10"});

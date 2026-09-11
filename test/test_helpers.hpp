@@ -1,13 +1,13 @@
 #pragma once
 
+#include "bme_core.hpp"
+
 #include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
-
-#include "bme_core.hpp"
 
 // Pull the library namespace into scope so these helpers and every test that includes this header use the `bme::` API unqualified.
 using namespace bme;
@@ -18,6 +18,7 @@ inline auto parse_cli(std::vector<std::string> args)
     args.insert(args.begin(), "bme");
 
     std::vector<char *> argv{};
+    argv.reserve(args.size());
     for (auto &&arg : args)
     {
         argv.emplace_back(arg.data());

@@ -11,7 +11,7 @@ Hard, always-apply rules. Background and full detail live in AGENTS.md.
 
 - Do NOT run a fresh CMake configure (`cmake -B ...`). It forces CPM to refetch and rebuild every dependency from scratch.
 - Default to header-grounded reasoning and reading the code. That is the expected level of verification.
-- If a compile check is genuinely needed, build incrementally against the build directory that is already configured. Do not create, delete, or reconfigure a build dir. Toolchain is clang / clang++ from `C:\Program Files\LLVM`.
+- If a compile check is genuinely needed, build incrementally against the configured build directory. Do not create, delete, or reconfigure a build directory. Windows uses clang / clang++ from `C:\Program Files\LLVM`. Linux uses the Debian 12 Clang 22 toolchain.
 - Codegen stays baseline x86-64 (SSE2, `-march=x86-64`). No AVX, no newer ISA, no `-march=native`. `bme` must run on any x86-64 CPU.
 - Never edit generated files. `bme_version.hpp` is generated from `bme_version.hpp.in` by CMake. Edit the template, never the output.
 

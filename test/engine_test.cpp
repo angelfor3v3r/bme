@@ -6,7 +6,14 @@
 #include <cstdint>
 #include <thread>
 
-namespace bme { void redisasm(Trace &trace, DisasmBackend backend, DisasmSyntax syntax) noexcept; } // namespace bme
+TEST(RunEngineInput, EmptyCodeRemainsIdle)
+{
+    std::array<std::uint8_t, 0> code{};
+    Registers                   seed{};
+    auto                        trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
+    EXPECT_EQ(trace.outcome, Outcome::Idle);
+    EXPECT_TRUE(trace.steps.empty());
+}
 
 TEST(RunEngineFault, PreservesExceptionStateWithoutCompletingInstruction)
 {
@@ -21,6 +28,38 @@ TEST(RunEngineFault, PreservesExceptionStateWithoutCompletingInstruction)
     EXPECT_FALSE(fault->reached);
     EXPECT_EQ(fault->rip, trace.stop_address);
     EXPECT_EQ(fault->registers.rip, trace.stop_address);
+}
+
+TEST(RunEngineBreakpoint, StopsOnPrefixedInt3WithoutCompletingInstruction)
+{
+    std::array<std::uint8_t, 2> code{0xF3, 0xCC};
+    Registers                   seed{};
+    auto                        trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
+    EXPECT_EQ(trace.outcome, Outcome::Stopped);
+    EXPECT_EQ(std::ranges::count_if(trace.steps, [](const Step &step) { return step.reached; }), 0);
+    EXPECT_EQ(trace.stop_address, trace.seed[Reg::RIP]);
+    EXPECT_EQ(trace.stop_reason, "Stopped here - int3 breakpoint");
+}
+
+TEST(RunEngineBreakpoint, StopsOnInterruptThreeWithoutCompletingInstruction)
+{
+    std::array<std::uint8_t, 2> code{0xCD, 0x03};
+    Registers                   seed{};
+    auto                        trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
+    EXPECT_EQ(trace.outcome, Outcome::Stopped);
+    EXPECT_EQ(std::ranges::count_if(trace.steps, [](const Step &step) { return step.reached; }), 0);
+    EXPECT_EQ(trace.stop_address, trace.seed[Reg::RIP]);
+    EXPECT_EQ(trace.stop_reason, "Stopped here - int3 breakpoint");
+}
+
+TEST(RunEngineBreakpoint, LockPrefixedInt3Faults)
+{
+    std::array<std::uint8_t, 2> code{0xF0, 0xCC};
+    Registers                   seed{};
+    auto                        trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
+    EXPECT_EQ(trace.outcome, Outcome::Faulted);
+    EXPECT_EQ(std::ranges::count_if(trace.steps, [](const Step &step) { return step.reached; }), 0);
+    EXPECT_EQ(trace.stop_address, trace.seed[Reg::RIP]);
 }
 
 TEST(RunEngineBoundary, IncompleteInstructionFaultsWithoutPadding)
@@ -81,6 +120,58 @@ TEST(RunEngineLimits, ZeroStillAllowsOneStep)
     EXPECT_EQ(trace.outcome, Outcome::AbortedCap);
     EXPECT_EQ(std::ranges::count_if(trace.steps, [](const Step &step) { return step.reached; }), 1);
     EXPECT_EQ(std::ranges::count_if(trace.steps, [](const Step &step) { return step.faulted; }), 0);
+}
+
+TEST(RunEngineFpu, PreservesSeededSseAndX87State)
+{
+    std::array<std::uint8_t, 1> code{0x90};
+    Registers                   seed{};
+    seed.xmm[0]                = {0x0123'4567'89AB'CDEF, 0xFEDC'BA98'7654'3210};
+    seed.st[0]                 = {0, 0, 0, 0, 0, 0, 0, 0x80, 0xFF, 0x3F};
+    seed.fpu_tag_word_abridged = 1;
+
+    auto trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
+    ASSERT_EQ(trace.outcome, Outcome::Finished);
+    ASSERT_EQ(trace.steps.size(), 1u);
+    EXPECT_EQ(trace.steps[0].registers.xmm[0], seed.xmm[0]);
+    EXPECT_EQ(trace.steps[0].registers.st[0], seed.st[0]);
+    EXPECT_NE(trace.steps[0].registers.fpu_tag_word_abridged & 1, 0);
+}
+
+TEST(RunEngineFpu, DecimalStSeedSurvivesFirstStep)
+{
+    std::array<std::uint8_t, 1>    code{0x90};
+    std::array<GPRSeed, GPR_COUNT> gpr{};
+    std::array<std::string, 16>    xmm{};
+    std::array<std::string, 8>     st{};
+    std::vector<std::string>       errors{};
+    st[0] = "1.5";
+
+    auto seed     = compose_seed(gpr, 0, xmm, st, errors);
+    auto expected = std::array<std::uint8_t, 10>{0, 0, 0, 0, 0, 0, 0, 0xC0, 0xFF, 0x3F};
+    ASSERT_TRUE(errors.empty());
+    EXPECT_EQ(seed.st[0], expected);
+
+    auto trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
+    ASSERT_EQ(trace.outcome, Outcome::Finished);
+    ASSERT_EQ(trace.steps.size(), 1u);
+    EXPECT_EQ(trace.steps[0].registers.st[0], expected);
+    EXPECT_NE(trace.steps[0].registers.fpu_tag_word_abridged & 1, 0);
+}
+
+TEST(RunEngineSeed, ScratchPointersCanBeDisabled)
+{
+    std::array<std::uint8_t, 1> code{0x90};
+    Registers                   seed{};
+
+    auto defaults = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
+    auto disabled = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, false);
+    ASSERT_EQ(defaults.outcome, Outcome::Finished);
+    ASSERT_EQ(disabled.outcome, Outcome::Finished);
+    EXPECT_NE(defaults.seed[Reg::RDI], 0ull);
+    EXPECT_EQ(defaults.seed[Reg::RDI], defaults.seed[Reg::RSI]);
+    EXPECT_EQ(disabled.seed[Reg::RDI], 0ull);
+    EXPECT_EQ(disabled.seed[Reg::RSI], 0ull);
 }
 
 TEST(RunEngineConcurrency, ConcurrentCallsProduceIndependentTraces)

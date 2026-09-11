@@ -6,16 +6,47 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
     message(FATAL_ERROR "bme: In-source builds are not supported. Run `cmake -B build`.")
 endif ()
 
-project(bme CXX C ASM_MASM)
+# Resolve Git metadata and derive the numeric package version from an exact release tag.
+find_program(GIT_EXECUTABLE git)
+set(BME_VERSION_HEADER "${CMAKE_BINARY_DIR}/generated/bme_version.hpp")
+set(BME_VERSION_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenerateVersion.cmake")
+set(BME_VERSION_ARGS
+    "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+    "-DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+    "-DIN=${CMAKE_CURRENT_SOURCE_DIR}/cmake/bme_version.hpp.in"
+    "-DOUT=${BME_VERSION_HEADER}")
 
-if (NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
-    message(FATAL_ERROR "${PROJECT_NAME}: Unsupported operating system. Only Windows is supported.")
+block(PROPAGATE BME_GIT_TAG)
+    set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    set(IN "${CMAKE_CURRENT_SOURCE_DIR}/cmake/bme_version.hpp.in")
+    set(OUT "${BME_VERSION_HEADER}")
+    include("${BME_VERSION_SCRIPT}")
+endblock()
+
+set(BME_PROJECT_VERSION "1.0.0")
+if (BME_GIT_TAG MATCHES "^v([0-9]+\\.[0-9]+\\.[0-9]+)$")
+    set(BME_PROJECT_VERSION "${CMAKE_MATCH_1}")
 endif ()
 
-# Supported compilers.
-# clang++ (GNU driver, primary/CI), clang-cl, and MSVC cl.
-# clang-cl shares MSVC's flag dialect + ABI, so it rides the MSVC path. `BME_IS_CLANG_CL` also flags it an LLVM backend
-# (takes `-march` via `/clang:`).
+project(bme VERSION "${BME_PROJECT_VERSION}" LANGUAGES C CXX)
+
+# Native engine backends are available only on Windows and Linux.
+if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+    set(BME_OS_WINDOWS ON)
+    enable_language(ASM_MASM)
+elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(BME_OS_LINUX ON)
+    enable_language(ASM)
+else ()
+    message(FATAL_ERROR "${PROJECT_NAME}: Unsupported operating system. Only Windows and Linux are supported.")
+endif ()
+
+if (NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$")
+    message(FATAL_ERROR "${PROJECT_NAME}: Only x86-64 is supported.")
+endif ()
+
+# clang++ is primary.
+# clang-cl and MSVC use the MSVC ABI path.
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
         set(BME_IS_CLANG ON)
@@ -23,10 +54,12 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         set(BME_IS_MSVC ON)
         set(BME_IS_CLANG_CL ON)
     endif ()
+elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set(BME_IS_GCC ON)
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     set(BME_IS_MSVC ON)
 else ()
-    message(FATAL_ERROR "${PROJECT_NAME}: Unsupported compiler. Only clang++ (GNU driver), clang-cl, and MSVC are supported.")
+    message(FATAL_ERROR "${PROJECT_NAME}: Unsupported compiler. Only clang++, clang-cl, MSVC, and GCC are supported.")
 endif ()
 
 if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -37,25 +70,27 @@ elseif (CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
     message(FATAL_ERROR "${PROJECT_NAME}: MinSizeRel is not supported.")
 endif ()
 
-# `-Werror` is brittle as a permanent flag.
-# A newer compiler's warnings break an otherwise-fine build. So make warnings fatal only in CI, where the toolchain is
-# pinned (GitHub sets CI=1). Locally they still show but don't block.
+# CI uses a pinned compiler, so only CI promotes warnings to errors.
 if (DEFINED ENV{CI})
     set(BME_WERROR_DEFAULT ON)
 else ()
     set(BME_WERROR_DEFAULT OFF)
 endif ()
 
-# Project options live together after their defaults are established.
+# Project options follow their derived defaults.
 option(BME_BUILD_TESTS "Build the unit tests" OFF)
 option(BME_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ${BME_WERROR_DEFAULT})
 
+# Emit compilation metadata and build dependencies statically.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(BUILD_SHARED_LIBS OFF)
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-# Route git at the tracked pre-commit hook (rejects unformatted commits) for local clones.
-find_program(GIT_EXECUTABLE git)
+# Match BME's Windows targets to the static CRT.
+if (BME_OS_WINDOWS)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif ()
+
+# Configure local clones to use the tracked formatting hook.
 if (GIT_EXECUTABLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
     execute_process(
         COMMAND "${GIT_EXECUTABLE}" config core.hooksPath .githooks
@@ -63,13 +98,17 @@ if (GIT_EXECUTABLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
         OUTPUT_QUIET ERROR_QUIET)
 endif ()
 
+# Load third-party and project CMake modules.
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cmake" "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CPM)
 
-# MSVC's UCRT marks standard functions (getenv, etc) as "insecure".
-# Silence it for our code + the fetched deps.
-add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+if (BME_OS_WINDOWS)
+    # MSVC's UCRT marks standard functions as insecure.
+    # Silence it for our code and fetched dependencies.
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+endif ()
 
+# Runtime, UI, and decoder dependencies.
 CPMAddPackage(URI "gh:fmtlib/fmt#1be298e1bd68957e4cd352e1f676f00e07dcfb57" # 12.2.0
     OPTIONS
     "FMT_DOC OFF"
@@ -107,72 +146,74 @@ CPMAddPackage(URI "gh:capstone-engine/capstone#022575848782a4801fd150fdbc927effc
     "CAPSTONE_INSTALL OFF"
     "CAPSTONE_X86_SUPPORT ON")
 
-# Intel XED decoder backend. No native CMake, built via `mfile.py` through ExternalProject (see `cmake/XED.cmake`).
+# XED builds through mfile.py because it has no native CMake target.
 include(XED)
 
-# MASM assembly target.
-add_library(bme_asm OBJECT src/st80.asm)
+# Platform-specific x87 conversion leaves.
+if (BME_OS_WINDOWS)
+    add_library(bme_asm OBJECT src/st80.asm)
+else ()
+    add_library(bme_asm OBJECT src/st80.S)
+endif ()
 
-# `--version` reads a generated header.
-# The custom target re-runs every build, but `configure_file` rewrites only on change, so a target recompiles only when
-# the tag/hash move. Also generated at configure time so the header exists up front.
-set(BME_VERSION_HEADER "${CMAKE_BINARY_DIR}/generated/bme_version.hpp")
-set(BME_VERSION_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenerateVersion.cmake")
-set(BME_VERSION_ARGS
-    "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
-    "-DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
-    "-DIN=${CMAKE_CURRENT_SOURCE_DIR}/cmake/bme_version.hpp.in"
-    "-DOUT=${BME_VERSION_HEADER}")
-execute_process(COMMAND "${CMAKE_COMMAND}" ${BME_VERSION_ARGS} -P "${BME_VERSION_SCRIPT}")
+# One OS backend supplies VM, clipboard, and single-step support.
+if (BME_OS_WINDOWS)
+    set(BME_PLATFORM_SOURCE src/os.windows.cpp)
+else ()
+    set(BME_PLATFORM_SOURCE src/os.linux.cpp)
+endif ()
+
+# Refresh Git metadata before targets build.
+# configure_file rewrites the header only when it changes.
 add_custom_target(bme_version
     BYPRODUCTS "${BME_VERSION_HEADER}"
     COMMAND "${CMAKE_COMMAND}" ${BME_VERSION_ARGS} -P "${BME_VERSION_SCRIPT}"
     COMMENT "Resolving git version"
     VERBATIM)
 
-# Shared build settings, applied to every bme target so nothing drifts.
-# Compile standard, preprocessor definitions, include dirs, the version-header dependency, and the baseline x86-64
-# codegen floor. Warnings are separate (see below) so the test target can skip `-Werror`.
+# Shared language, generated-header, and baseline codegen settings.
 function(bme_apply_common_config target)
     target_compile_features(${target} PRIVATE cxx_std_23)
     target_compile_definitions(${target}
         PRIVATE
-        $<IF:$<CONFIG:Debug>,BME_DEBUG=1,BME_DEBUG=0>
-        NOMINMAX UNICODE _UNICODE WINVER=0x0A00 _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN)
+        $<IF:$<CONFIG:Debug>,BME_DEBUG=1,BME_DEBUG=0>)
     target_include_directories(${target} PRIVATE src "${CMAKE_BINARY_DIR}/generated")
     add_dependencies(${target} bme_version)
 
-    if (BME_IS_CLANG)
+    if (BME_OS_WINDOWS)
+        target_compile_definitions(${target} PRIVATE NOMINMAX UNICODE _UNICODE WINVER=0x0A00 _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN)
+    else ()
+        target_compile_definitions(${target} PRIVATE _GNU_SOURCE)
+    endif ()
+
+    if (BME_IS_CLANG OR BME_IS_GCC)
         target_compile_options(${target} PRIVATE $<$<CONFIG:Debug>:-g3 -O0>)
-        target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-fno-ident -g0 -O3>)
+        target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-g0 -O3>)
         target_compile_options(${target} PRIVATE $<$<CONFIG:RelWithDebInfo>:-g3 -O3>)
 
-        # Baseline x86-64 (SSE2, no AVX).
-        # Runs on any x86-64 CPU and pins the floor against a stray `-march=native`. Clang already defaults here. This
-        # just makes it explicit.
+        if (BME_IS_CLANG)
+            target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-fno-ident>)
+        endif ()
+
+        # Use baseline x86-64 and SSE2 with no AVX.
         target_compile_options(${target} PRIVATE -march=x86-64 -mtune=generic)
     elseif (BME_IS_MSVC)
-        # MSVC's per-config defaults already cover the base (`/Od /Zi` Debug, `/O2` Release).
-        # Add only what they omit. Intrinsics and dead code/data stripping in the optimized configs.
+        # MSVC's per-config defaults cover the base optimization choices.
         target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/Oi /Gy /Gw>)
         target_compile_options(${target} PRIVATE $<$<CONFIG:RelWithDebInfo>:/Oi /Gy /Gw>)
 
-        # clang-cl is an LLVM backend.
-        # Pin the same baseline x86-64 floor via the `/clang:` escape. Plain cl needs nothing. SSE2 is its immutable x64
-        # default and there's no baseline `/arch:` knob.
         if (BME_IS_CLANG_CL)
             target_compile_options(${target} PRIVATE /clang:-march=x86-64 /clang:-mtune=generic)
         endif ()
     endif ()
 
-    # XED's static lib comes from the `mfile.py` ExternalProject.
-    # Make sure it's built before anything links it.
+    # Every compiled target waits for XED's external build.
     add_dependencies(${target} xed_build)
 endfunction()
 
-# Warning policy, kept off the test target so GoogleTest's macro expansions can't trip the CI `-Werror` build.
+# Keep warnings off bme_tests so GoogleTest macros cannot trip CI's -Werror.
 function(bme_apply_warnings target)
-    if (BME_IS_CLANG)
+    if (BME_IS_CLANG OR BME_IS_GCC)
         target_compile_options(${target}
             PRIVATE
             -Wall
@@ -195,24 +236,39 @@ function(bme_apply_warnings target)
     endif ()
 endfunction()
 
-# Core library.
-# All of bme's logic except `main`, so the unit tests can link and call it directly. STATIC keeps a single build of the
-# translation unit. PRIVATE deps still propagate onto a consumer's link line, so `bme` links ftxui/decoders
-# transitively.
-add_library(bme_core STATIC src/bme_core.cpp)
+# Shared core lets tests reuse BME logic.
+# CMake forwards its static dependencies to bme.
+add_library(bme_core STATIC src/bme_core.cpp src/os.cpp ${BME_PLATFORM_SOURCE})
 bme_apply_common_config(bme_core)
 bme_apply_warnings(bme_core)
 target_link_libraries(bme_core
     PUBLIC fmt::fmt
     PRIVATE argparse::argparse ftxui::ftxui Zydis::Zydis bddisasm::bddisasm capstone_static xed bme_asm)
 
-# The TUI/CLI executable.
-# A thin `main` over `bme_core`.
+# Thin CLI and TUI entry point.
 add_executable(bme src/main.cpp)
 bme_apply_common_config(bme)
 bme_apply_warnings(bme)
 target_link_libraries(bme PRIVATE bme_core)
-source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES src/bme_core.cpp src/main.cpp)
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES src/bme_core.cpp src/os.cpp ${BME_PLATFORM_SOURCE} src/main.cpp)
+
+# Only the executable is installed. bme_core remains an internal test seam.
+include(GNUInstallDirs)
+install(TARGETS bme RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+
+# Package native Linux builds as DEB and TGZ.
+if (BME_OS_LINUX)
+    set(CPACK_PACKAGE_VENDOR "angelfor3v3r")
+    set(CPACK_PACKAGE_CONTACT "angelfor3v3r")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Bare-metal x86-64 machine-code viewer")
+    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+    set(CPACK_GENERATOR "DEB;TGZ")
+    set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+    set(CPACK_DEBIAN_PACKAGE_MAINTAINER "${CPACK_PACKAGE_CONTACT}")
+    set(CPACK_DEBIAN_PACKAGE_SECTION "utils")
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+    include(CPack)
+endif ()
 
 # Unit tests.
 if (BME_BUILD_TESTS)
@@ -221,10 +277,8 @@ if (BME_BUILD_TESTS)
         "INSTALL_GTEST OFF"
         "BUILD_GMOCK OFF"
         "gtest_force_shared_crt OFF")
-
     enable_testing()
     include(GoogleTest)
-
     add_executable(bme_tests
         test/main.cpp
         test/parse_test.cpp

@@ -8,6 +8,10 @@
 #define BME_GIT_URL  "https://github.com/angelfor3v3r/bme"
 #endif
 
+#include "bme_core.hpp"
+#include "os.hpp"
+#include "util.hpp"
+
 #include <argparse/argparse.hpp>
 #include <bddisasm.h>
 #include <capstone/capstone.h>
@@ -49,50 +53,11 @@ extern "C"
 #include <utility>
 #include <vector>
 
-#include <ntstatus.h>
-#include <Windows.h>
-#include <winternl.h>
-
-#include "bme_core.hpp"
-
 namespace bme
 {
 
-// The declarations below for the ASM stubs are internal to this translation unit.
-// They are deliberately not in `bme_core.hpp`, which carries only the public API that the thin `main` and the unit tests consume.
-//
-// 80-bit x87 extended -> 64-bit double, rounded on the FPU with the supplied x87 control word.
-extern "C" double st80_to_double(const std::array<std::uint8_t, 10> &bytes, std::uint16_t fpu_control_word) noexcept;
-
-// 64-bit double -> 80-bit x87 extended, converted on the FPU (see `src/st80.asm`).
-// Writes 10 bytes to `out`.
-extern "C" void double_to_st80(double value, std::array<std::uint8_t, 10> &out) noexcept;
-
-// 80-bit x87 extended -> 32-bit float, rounded on the FPU with the supplied x87 control word.
-extern "C" float st80_to_float(const std::array<std::uint8_t, 10> &bytes, std::uint16_t fpu_control_word) noexcept;
-
-// Older Windows versions may not report a usable required size.
-// Keep retries bounded.
-constexpr std::size_t PROCESS_QUERY_INITIAL_BYTES = 0x10000;
-constexpr std::size_t PROCESS_QUERY_MAX_BYTES     = 0x4000000;
-constexpr std::size_t PROCESS_PARENT_ID_OFFSET    = offsetof(SYSTEM_PROCESS_INFORMATION, UniqueProcessId) + sizeof(HANDLE);
-constexpr std::size_t PROCESS_RECORD_MIN_BYTES    = PROCESS_PARENT_ID_OFFSET + sizeof(HANDLE);
-
-constexpr std::size_t SCRATCH_STACK_BYTES = 0x10000; // 64 KiB stack memory.
-constexpr std::size_t SCRATCH_DATA_BYTES  = 0x10000; // 64 KiB scratch memory. RDI/RSI point here by default.
-
-// Fixed preferred reservation base for the scratch data region (64 KiB-aligned) so seeds can reference it up front.
-// Usable base is this + one guard page.
-constexpr std::uint64_t SCRATCH_DATA_BASE = 0x1000'0000;
-
-// The seedable subset (status flags + DF).
-// Everything else is engine-owned. TF drives stepping, IF and reserved bit 1 are forced on.
-constexpr auto RFLAGS_STATUS_MASK = CF | PF | AF | ZF | SF | DF | OF;
-
-// Engine-owned RFLAGS control bits (not user-seedable).
-constexpr std::uint64_t RFLAGS_TRAP_FLAG      = 0x100; // Drives single-stepping.
-constexpr std::uint64_t RFLAGS_INTERRUPT_FLAG = 0x200; // Forced on (interrupts enabled in user mode).
-constexpr std::uint64_t RFLAGS_RESERVED_BIT1  = 0x2;   // Bit 1, always set.
+template <class E>
+using Error = std::unexpected<E>;
 
 // Shown by `--version` and the TUI About box.
 // Keep the copyright in sync with LICENSE.
@@ -270,16 +235,13 @@ auto backend_supports(DisasmBackend backend, DisasmSyntax syntax) noexcept
     return syntax == DisasmSyntax::ATT ? info.att_syntax : info.intel_syntax;
 }
 
-std::size_t g_page_size{};              // OS page size (`SYSTEM_INFO.dwPageSize`). Set once by `init`.
-std::size_t g_allocation_granularity{}; // OS allocation granularity (`SYSTEM_INFO.dwAllocationGranularity`). Set once by `init`.
+std::size_t g_page_size{};
+std::size_t g_allocation_granularity{};
 
 void init()
 {
-    SYSTEM_INFO system_info{};
-    GetSystemInfo(&system_info);
-
-    g_page_size              = (std::size_t)system_info.dwPageSize;
-    g_allocation_granularity = (std::size_t)system_info.dwAllocationGranularity;
+    g_page_size              = vm_page_size();
+    g_allocation_granularity = vm_allocation_granularity();
 }
 
 auto format_hex64_string(std::uint64_t value) { return fmt::format("0x{:016X}", value); }
@@ -308,284 +270,6 @@ auto format_float(T value)
 
 // Append `f` to single-precision lanes so copied values preserve their precision.
 auto format_float_single(float value) { return format_float(value) + "f"; }
-
-template <class String>
-concept StringViewCompatible = requires(String &&value) { std::basic_string_view{std::forward<String>(value)}; };
-
-template <StringViewCompatible Left, StringViewCompatible Right>
-bool ascii_case_insensitive_equal(Left &&left, Right &&right) noexcept
-{
-    auto left_view  = std::basic_string_view{std::forward<Left>(left)};
-    auto right_view = std::basic_string_view{std::forward<Right>(right)};
-
-    return std::ranges::equal(
-        left_view, right_view,
-        [](auto left_char, auto right_char) noexcept
-        {
-            auto lowercase = [](auto character) noexcept
-            {
-                using Character = decltype(character);
-
-                return character >= (Character)'A' && character <= (Character)'Z' ? (Character)(character + ((Character)'a' - (Character)'A'))
-                                                                                  : character;
-            };
-
-            return lowercase(left_char) == lowercase(right_char);
-        }
-    );
-}
-
-// Copy text to the Windows clipboard.
-bool copy_to_clipboard(std::string_view text) noexcept
-{
-    if (text.empty() || OpenClipboard(nullptr) == FALSE)
-    {
-        return false;
-    }
-
-    if (EmptyClipboard() == FALSE)
-    {
-        CloseClipboard();
-
-        return false;
-    }
-
-    bool  copied{};
-    auto *handle = GlobalAlloc(GMEM_MOVEABLE, text.size() + 1);
-    if (handle != nullptr)
-    {
-        auto *buffer = (char *)GlobalLock(handle);
-        if (buffer != nullptr)
-        {
-            auto result = std::ranges::copy(text, buffer);
-            *result.out = '\0';
-
-            GlobalUnlock(handle);
-
-            // Ownership transfers to the clipboard only on success.
-            copied = SetClipboardData(CF_TEXT, handle) != nullptr;
-            if (!copied)
-            {
-                GlobalFree(handle);
-            }
-        }
-        else
-        {
-            GlobalFree(handle);
-        }
-    }
-
-    return CloseClipboard() != FALSE && copied;
-}
-
-std::string environment_string(std::string_view name) noexcept
-{
-    std::string environment_name{name};
-    if (environment_name.empty())
-    {
-        return {};
-    }
-
-    // A null buffer with size zero reports the required size for a nonempty value.
-    auto required = GetEnvironmentVariableA(environment_name.c_str(), nullptr, 0);
-    if (required == 0)
-    {
-        return {};
-    }
-
-    auto        capacity = required;
-    std::string value(capacity, '\0');
-    for (;;)
-    {
-        auto written = GetEnvironmentVariableA(environment_name.c_str(), value.data(), capacity);
-        if (written == 0)
-        {
-            return {};
-        }
-
-        if (written < capacity)
-        {
-            value.resize(written);
-
-            return value;
-        }
-
-        capacity = written;
-
-        value.resize(capacity);
-    }
-}
-
-bool environment_present(std::string_view name) noexcept
-{
-    std::string environment_name{name};
-    if (environment_name.empty())
-    {
-        return false;
-    }
-
-    SetLastError(ERROR_SUCCESS);
-
-    auto required = GetEnvironmentVariableA(environment_name.c_str(), nullptr, 0);
-
-    return required != 0 || GetLastError() == ERROR_SUCCESS;
-}
-
-bool parent_process_is(std::initializer_list<std::string_view> executable_names) noexcept
-{
-    using NtQuerySystemInformationFn = NTSTATUS(NTAPI *)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
-
-    static auto query = [] -> NtQuerySystemInformationFn
-    {
-        auto ntdll = GetModuleHandleA("ntdll.dll");
-        if (ntdll == nullptr)
-        {
-            return nullptr;
-        }
-
-        return (NtQuerySystemInformationFn)GetProcAddress(ntdll, "NtQuerySystemInformation");
-    }();
-    if (query == nullptr)
-    {
-        return false;
-    }
-
-    std::vector<std::uint8_t> process_buffer(PROCESS_QUERY_INITIAL_BYTES);
-    ULONG                     process_buffer_length{};
-    for (;;)
-    {
-        auto status = query(SystemProcessInformation, process_buffer.data(), (ULONG)process_buffer.size(), &process_buffer_length);
-        if (NT_SUCCESS(status))
-        {
-            if ((std::size_t)process_buffer_length > process_buffer.size())
-            {
-                return false;
-            }
-
-            break;
-        }
-
-        if (status != STATUS_INFO_LENGTH_MISMATCH && status != STATUS_BUFFER_TOO_SMALL)
-        {
-            return false;
-        }
-
-        auto next_size = process_buffer.size();
-        if ((std::size_t)process_buffer_length > next_size)
-        {
-            next_size = (std::size_t)process_buffer_length;
-        }
-        else if (next_size <= PROCESS_QUERY_MAX_BYTES / 2)
-        {
-            next_size *= 2;
-        }
-        else
-        {
-            next_size = PROCESS_QUERY_MAX_BYTES;
-        }
-
-        if (next_size <= process_buffer.size() || next_size > PROCESS_QUERY_MAX_BYTES)
-        {
-            return false;
-        }
-
-        process_buffer.resize(next_size);
-    }
-
-    auto process_id_from_handle = [](HANDLE native_process_id) noexcept { return (DWORD)(ULONG_PTR)native_process_id; };
-
-    auto find_process = [&process_buffer, process_buffer_length,
-                         &process_id_from_handle](DWORD target_process_id) noexcept -> PSYSTEM_PROCESS_INFORMATION
-    {
-        auto       *buffer_begin = process_buffer.data();
-        auto        buffer_size  = (std::size_t)process_buffer_length;
-        std::size_t process_offset{};
-        for (;;)
-        {
-            if (process_offset > buffer_size || buffer_size - process_offset < PROCESS_RECORD_MIN_BYTES)
-            {
-                return nullptr;
-            }
-
-            auto *process = (PSYSTEM_PROCESS_INFORMATION)(buffer_begin + process_offset);
-            if (process_id_from_handle(process->UniqueProcessId) == target_process_id)
-            {
-                return process;
-            }
-
-            auto next_offset = (std::size_t)process->NextEntryOffset;
-            if (next_offset == 0 || next_offset < PROCESS_RECORD_MIN_BYTES || next_offset > buffer_size - process_offset)
-            {
-                return nullptr;
-            }
-
-            process_offset += next_offset;
-        }
-    };
-
-    auto *current_process = find_process(GetCurrentProcessId());
-    if (current_process == nullptr)
-    {
-        return false;
-    }
-
-    // SDK versions give the parent ID slot different member names.
-    HANDLE native_parent_id{};
-    std::memcpy(&native_parent_id, (std::uint8_t *)current_process + PROCESS_PARENT_ID_OFFSET, sizeof(native_parent_id));
-
-    auto  parent_id = process_id_from_handle(native_parent_id);
-    auto *parent    = find_process(parent_id);
-    if (parent == nullptr || parent->ImageName.Buffer == nullptr)
-    {
-        return false;
-    }
-
-    // Length is in bytes.
-    // Reject a partial UTF-16 code unit.
-    auto image_length_bytes = (std::size_t)parent->ImageName.Length;
-    if (image_length_bytes % sizeof(wchar_t) != 0)
-    {
-        return false;
-    }
-
-    // The kernel returns `ImageName.Buffer` inside this query buffer.
-    // Check it before making a view.
-    auto buffer_begin = (std::uintptr_t)process_buffer.data();
-    auto buffer_end   = buffer_begin + (std::size_t)process_buffer_length;
-    auto image_begin  = (std::uintptr_t)parent->ImageName.Buffer;
-    if (image_begin < buffer_begin || image_begin > buffer_end)
-    {
-        return false;
-    }
-
-    if (image_length_bytes > buffer_end - image_begin)
-    {
-        return false;
-    }
-
-    std::wstring_view image_path{parent->ImageName.Buffer, image_length_bytes / sizeof(wchar_t)};
-    auto              delim           = image_path.find_last_of(L"\\/");
-    auto              executable_name = delim == std::wstring_view::npos ? image_path : image_path.substr(delim + 1);
-
-    for (auto &&expected_name : executable_names)
-    {
-        if (ascii_case_insensitive_equal(executable_name, expected_name))
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-bool is_sde() noexcept { return environment_present("SDE_COMMAND_LINE") || parent_process_is({"sde.exe"}) || GetModuleHandleA("sde.dll") != nullptr; }
-
-bool is_pin() noexcept
-{
-    return environment_present("PIN_COMMAND_LINE") || parent_process_is({"pin.exe", "pinbin.exe"}) || GetModuleHandleA("pinvm.dll") != nullptr;
-}
-
-bool instrumentation_detected() noexcept { return is_sde() || is_pin(); }
 
 // Classify an x87 register for display.
 // `valid` is the FXSAVE abridged tag bit. When set, the 80-bit value is inspected for Zero/Special/Nonzero.
@@ -685,7 +369,7 @@ std::vector<std::string> decode_mxcsr(std::uint32_t mxcsr)
 
 // Render a decoded control/status word as stacked lines.
 // `prefix` on the first, each group (Masks/Flags/CC/Modes) indented on its own line so nothing wraps off-screen.
-auto decode_block(const std::string &prefix, const std::vector<std::string> &groups) noexcept
+auto decode_block(const std::string &prefix, const std::vector<std::string> &groups)
 {
     ftxui::Elements lines{};
     for (std::size_t i{}; i < groups.size(); ++i)
@@ -730,6 +414,11 @@ Result<std::vector<std::uint8_t>, std::string> parse_hex(std::string_view text)
         i += 2;
     }
 
+    if (result.empty())
+    {
+        return Error{"No code to run"};
+    }
+
     return result;
 }
 
@@ -751,34 +440,6 @@ Result<std::uint64_t, std::string> parse_seed(std::string_view seed)
     }
 
     return result;
-}
-
-std::string_view fault_name(DWORD exc_code) noexcept
-{
-    switch (exc_code)
-    {
-    case EXCEPTION_ACCESS_VIOLATION:         return "Access violation";
-    case EXCEPTION_ILLEGAL_INSTRUCTION:      return "Illegal instruction";
-    case EXCEPTION_PRIV_INSTRUCTION:         return "Privileged instruction";
-    case EXCEPTION_INT_DIVIDE_BY_ZERO:       return "Divide by zero";
-    case EXCEPTION_INT_OVERFLOW:             return "Integer overflow";
-    case EXCEPTION_STACK_OVERFLOW:           return "Stack overflow";
-    case EXCEPTION_DATATYPE_MISALIGNMENT:    return "Misaligned access";
-    case EXCEPTION_BREAKPOINT:               return "Breakpoint (int3)";
-    case EXCEPTION_IN_PAGE_ERROR:            return "In-page error";
-    case EXCEPTION_GUARD_PAGE:               return "Guard page violation";
-    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:    return "Array bounds exceeded";
-    case EXCEPTION_FLT_DIVIDE_BY_ZERO:       return "FP divide by zero";
-    case EXCEPTION_FLT_INVALID_OPERATION:    return "FP invalid operation";
-    case EXCEPTION_FLT_OVERFLOW:             return "FP overflow";
-    case EXCEPTION_FLT_UNDERFLOW:            return "FP underflow";
-    case EXCEPTION_FLT_INEXACT_RESULT:       return "FP inexact result";
-    case EXCEPTION_FLT_DENORMAL_OPERAND:     return "FP denormal operand";
-    case EXCEPTION_FLT_STACK_CHECK:          return "FP stack check";
-    case EXCEPTION_NONCONTINUABLE_EXCEPTION: return "Noncontinuable exception";
-    case EXCEPTION_INVALID_DISPOSITION:      return "Invalid disposition";
-    default:                                 return "Exception";
-    }
 }
 
 // Parses a decimal with an optional trailing precision suffix.
@@ -1025,6 +686,7 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
         max_steps = std::min(max_steps, MAX_STEPS_LIMIT);
     }
 
+    // Default mask, then check each argument.
     TrackMask track{.gpr = true, .rip = true, .rflags = true};
     if (auto track_text = program.present<std::string>("--track"))
     {
@@ -1263,82 +925,20 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
     };
 }
 
-struct RawStep
+namespace
 {
-    std::uint64_t rip{};
-    Registers     registers{};
-};
 
-struct Engine
+std::mutex g_engine_mutex{};
+
+struct Decoded
 {
-    void snapshot(CONTEXT *context, Registers &registers) const noexcept
-    {
-        registers[Reg::RAX] = context->Rax;
-        registers[Reg::RBX] = context->Rbx;
-        registers[Reg::RCX] = context->Rcx;
-        registers[Reg::RDX] = context->Rdx;
-        registers[Reg::RSI] = context->Rsi;
-        registers[Reg::RDI] = context->Rdi;
-        registers[Reg::RBP] = context->Rbp;
-        registers[Reg::RSP] = context->Rsp;
-        registers[Reg::R8]  = context->R8;
-        registers[Reg::R9]  = context->R9;
-        registers[Reg::R10] = context->R10;
-        registers[Reg::R11] = context->R11;
-        registers[Reg::R12] = context->R12;
-        registers[Reg::R13] = context->R13;
-        registers[Reg::R14] = context->R14;
-        registers[Reg::R15] = context->R15;
-        registers.rip       = context->Rip;
+    std::string  text{};
+    std::uint8_t length{}; // x86-64 instructions are at most 15 bytes.
 
-        // Hide the engine-owned trap flag.
-        registers.rflags = context->EFlags & ~RFLAGS_TRAP_FLAG;
+    [[nodiscard]] bool valid() const noexcept { return !text.empty() && length != 0; }
 
-        snapshot_fpu(context, registers);
-    }
-
-    void snapshot_fpu(CONTEXT *context, Registers &registers) const noexcept
-    {
-        for (std::size_t i{}; i < registers.xmm.size(); ++i)
-        {
-            registers.xmm[i][0] = context->FltSave.XmmRegisters[i].Low;
-            registers.xmm[i][1] = (std::uint64_t)context->FltSave.XmmRegisters[i].High;
-        }
-
-        for (std::size_t i{}; i < registers.st.size(); ++i)
-        {
-            std::memcpy(registers.st[i].data(), &context->FltSave.FloatRegisters[i], 10);
-        }
-
-        registers.mxcsr                 = context->MxCsr;
-        registers.fpu_control_word      = context->FltSave.ControlWord;
-        registers.fpu_status_word       = context->FltSave.StatusWord;
-        registers.fpu_tag_word_abridged = context->FltSave.TagWord;
-    }
-
-    // Exact input byte range inside the executable mapping.
-    std::uint64_t base{};
-    std::uint64_t code_length{};
-
-    // Run configuration.
-    std::size_t max_steps{};
-
-    // Sandbox thread state.
-    DWORD         thread_id{};
-    std::uint64_t previous_rip{};
-    CONTEXT       saved_context{}; // Sandbox thread's pristine context (bail-back target).
-    bool          active{};
-
-    // Recorded steps and outcome.
-    std::vector<RawStep> raw_steps{};
-    Outcome              outcome = Outcome::Finished;
-    DWORD                fault_code{};
-    std::uint64_t        fault_address{};
-    Registers            fault_registers{};
+    explicit operator bool() const noexcept { return valid(); }
 };
-
-std::unique_ptr<Engine> g_engine{};
-std::mutex              g_engine_mutex{};
 
 // Disassemble one x86-64 instruction with the selected backend and syntax.
 // Only construction of the result string can fail.
@@ -1354,7 +954,7 @@ Decoded disasm_one(DisasmBackend backend, DisasmSyntax syntax, std::uint64_t add
         if (ZYAN_SUCCESS(status))
         {
             result.text   = ix.text;
-            result.length = ix.info.length;
+            result.length = (std::uint8_t)ix.info.length;
         }
     }
     else if (backend == DisasmBackend::Bddisasm)
@@ -1364,7 +964,7 @@ Decoded disasm_one(DisasmBackend backend, DisasmSyntax syntax, std::uint64_t add
         if (ND_SUCCESS(NdDecodeEx(&ix, code, size, ND_CODE_64, ND_DATA_64)) && ND_SUCCESS(NdToText(&ix, address, sizeof(text), text)))
         {
             result.text   = text;
-            result.length = ix.Length;
+            result.length = (std::uint8_t)ix.Length;
         }
     }
     else if (backend == DisasmBackend::Capstone)
@@ -1378,7 +978,7 @@ Decoded disasm_one(DisasmBackend backend, DisasmSyntax syntax, std::uint64_t add
             if (cs_disasm(handle, code, size, address, 1, &ix) > 0)
             {
                 result.text   = ix->op_str[0] != '\0' ? std::string{ix->mnemonic} + ' ' + ix->op_str : std::string(ix->mnemonic);
-                result.length = ix->size;
+                result.length = (std::uint8_t)ix->size;
 
                 cs_free(ix, 1);
             }
@@ -1404,7 +1004,7 @@ Decoded disasm_one(DisasmBackend backend, DisasmSyntax syntax, std::uint64_t add
                 != 0)
             {
                 result.text   = text;
-                result.length = xed_decoded_inst_get_length(&ix);
+                result.length = (std::uint8_t)xed_decoded_inst_get_length(&ix);
             }
         }
     }
@@ -1412,7 +1012,7 @@ Decoded disasm_one(DisasmBackend backend, DisasmSyntax syntax, std::uint64_t add
     // Preserve each decoder's exact text.
     // Never normalize casing/spacing/operands (that native formatting is what we diff between backends). Only trim surrounding whitespace so the
     // panels line up.
-    static auto not_space = [](char c) noexcept { return std::isspace((std::uint8_t)c) == 0; };
+    auto not_space = [](char character) noexcept { return std::isspace((std::uint8_t)character) == 0; };
 
     auto lead  = std::ranges::find_if(result.text, not_space);
     auto trail = std::ranges::find_if(result.text | std::views::reverse, not_space).base();
@@ -1425,98 +1025,24 @@ Decoded disasm_one(DisasmBackend backend, DisasmSyntax syntax, std::uint64_t add
 // Reservation base for the scratch data region.
 // The fixed VA rounded down to the allocation granularity (where `MEM_RESERVE` lands it anyway). Usable memory (what seeds and `[mem]` target) starts
 // one guard page above.
-std::uint64_t scratch_reserve_base() noexcept { return SCRATCH_DATA_BASE & ~(g_allocation_granularity - 1); }
-
-// The sandbox runs on its own thread.
-// On completion/fault the VEH restores this thread's pristine entry context, so it falls through to here and exits cleanly.
-DWORD WINAPI sandbox_thread_main(LPVOID) { return 0; }
-
-LONG CALLBACK bme_veh(EXCEPTION_POINTERS *exception_pointers) noexcept
-{
-    if (g_engine == nullptr || !g_engine->active || GetCurrentThreadId() != g_engine->thread_id)
-    {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-
-    auto *context  = exception_pointers->ContextRecord;
-    auto  exc_code = exception_pointers->ExceptionRecord->ExceptionCode;
-    if (exc_code == EXCEPTION_SINGLE_STEP)
-    {
-        auto next_rip   = (std::uint64_t)context->Rip;
-        auto code_begin = g_engine->base;
-
-        // Build the step in place.
-        // The vector is pre-reserved to `max_steps`, so this never reallocates (keeping the trap path allocation-free) and avoids copying the full
-        // register snapshot.
-        auto &raw_step = g_engine->raw_steps.emplace_back();
-        raw_step.rip   = g_engine->previous_rip;
-
-        g_engine->snapshot(context, raw_step.registers);
-
-        auto code_end = code_begin + g_engine->code_length;
-        if (next_rip < code_begin || next_rip >= code_end)
-        {
-            g_engine->outcome = Outcome::Finished;
-
-            *context = g_engine->saved_context;
-
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-
-        if (g_engine->raw_steps.size() >= g_engine->max_steps)
-        {
-            g_engine->outcome = Outcome::AbortedCap;
-
-            *context = g_engine->saved_context;
-
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-
-        g_engine->previous_rip = next_rip;
-
-        // Re-arm the trap flag (cleared on #DB delivery).
-        context->EFlags |= (DWORD)RFLAGS_TRAP_FLAG;
-
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-
-    // CPUID runs directly on the host and therefore reports the host CPU's identity.
-    // int3 (#BP) is a breakpoint. Execution stops here. We don't record it as a step (it never ran through). The listing shows it and everything
-    // after it as "not reached".
-    if (exc_code == EXCEPTION_BREAKPOINT)
-    {
-        g_engine->outcome       = Outcome::Stopped;
-        g_engine->fault_address = (std::uint64_t)exception_pointers->ExceptionRecord->ExceptionAddress;
-
-        *context = g_engine->saved_context;
-
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-
-    // Any other exception on the sandbox thread is a genuine fault in the user's code.
-    // Preserve its partial state before restoring the pristine thread context.
-    g_engine->outcome       = Outcome::Faulted;
-    g_engine->fault_code    = exc_code;
-    g_engine->fault_address = (std::uint64_t)exception_pointers->ExceptionRecord->ExceptionAddress;
-
-    g_engine->snapshot(context, g_engine->fault_registers);
-
-    *context = g_engine->saved_context;
-
-    return EXCEPTION_CONTINUE_EXECUTION;
-}
+std::uint64_t scratch_reserve_base() noexcept { return SCRATCH_DATA_RESERVE_BASE & ~(g_allocation_granularity - 1); }
 
 struct HistoryStep
 {
+    // Decoded history row.
     std::uint64_t rip{};
     std::string   text{};
     std::size_t   offset{};
     std::size_t   length{};
-    std::size_t   execution_position{};
-    bool          reached{};
-    bool          faulted{};
-    bool          shows_fault_state{};
-    bool          data{};
+
+    // Execution state mapping.
+    std::size_t execution_position{};
+
+    // Row classification.
+    bool reached{};
+    bool faulted{};
+    bool shows_fault_state{};
+    bool data{};
 };
 
 // Build one decoder's instruction boundaries from the original input bytes.
@@ -1566,7 +1092,8 @@ auto decode_history_steps(const Trace &trace, DisasmBackend backend, DisasmSynta
 
     std::size_t execution_position{};
     bool        fault_state_available{};
-    auto        fill_gap = [&](std::uint64_t from, std::uint64_t to) noexcept
+
+    auto fill_gap = [&](std::uint64_t from, std::uint64_t to) noexcept
     {
         while (from < to)
         {
@@ -1614,6 +1141,7 @@ auto decode_history_steps(const Trace &trace, DisasmBackend backend, DisasmSynta
         entry.faulted            = source.faulted;
         entry.shows_fault_state  = fault_state_available || source.faulted;
         entry.execution_position = execution_position;
+
         if (entry.reached)
         {
             ++entry.execution_position;
@@ -1623,6 +1151,7 @@ auto decode_history_steps(const Trace &trace, DisasmBackend backend, DisasmSynta
         linear = std::max(linear, source.rip + entry.length);
 
         result.emplace_back(std::move(entry));
+
         fault_state_available = fault_state_available || source.faulted;
     }
 
@@ -1644,7 +1173,6 @@ void apply_history_steps(Trace &trace, std::vector<HistoryStep> decoded_steps) n
 
         auto bytes = std::span{trace.code}.subspan(decoded.offset, decoded.length);
         step.bytes.assign(bytes.begin(), bytes.end());
-
         step.text    = std::move(decoded.text);
         step.reached = decoded.reached;
         step.faulted = decoded.faulted;
@@ -1668,6 +1196,8 @@ void apply_history_steps(Trace &trace, std::vector<HistoryStep> decoded_steps) n
     trace.steps = std::move(rebuilt);
 }
 
+} // namespace
+
 // TODO Move machine-code execution to a worker process.
 //      In-process code can mutate or terminate the host.
 //
@@ -1680,343 +1210,77 @@ Trace run_engine(
 {
     std::lock_guard engine_lock{g_engine_mutex};
 
+    auto result = run_platform_steps({
+        .code                 = code,
+        .seed                 = seed,
+        .max_steps            = max_steps,
+        .scratch_reserve_base = scratch_reserve_base(),
+        .seed_data_pointers   = seed_data_pointers,
+    });
+
     Trace trace{};
-    trace.seed = seed;
+    trace.seed              = result.seed;
+    trace.outcome           = result.outcome;
+    trace.emulator_detected = result.instrumentation_detected;
 
-    if (instrumentation_detected())
+    if (!result.instrumentation_detected && !code.empty())
     {
-        trace.outcome           = Outcome::Faulted;
-        trace.emulator_detected = true;
-        trace.message           = std::string{EMULATOR_WARNING} + " No trace was recorded.";
+        trace.code.assign(code.begin(), code.end());
+    }
+
+    if (result.instrumentation_detected)
+    {
+        trace.message = result.error + " No trace was recorded.";
 
         return trace;
     }
 
-    if (code.empty())
+    if (!result.error.empty())
     {
-        trace.outcome = Outcome::Finished;
-        trace.message = "No code to run.";
+        trace.message = std::move(result.error);
 
         return trace;
     }
 
-    trace.code.assign(code.begin(), code.end());
-
-    SIZE_T code_region = code.size() + g_page_size - 1 & ~(g_page_size - 1);
-    auto  *buffer      = (std::uint8_t *)VirtualAlloc(nullptr, code_region + g_page_size, MEM_RESERVE, PAGE_NOACCESS);
-    auto  *stack       = (std::uint8_t *)VirtualAlloc(nullptr, SCRATCH_STACK_BYTES + g_page_size, MEM_RESERVE, PAGE_NOACCESS);
-
-    // Users can seed registers with the displayed scratch address.
-    // Reserve this region at its fixed base instead of falling back elsewhere.
-    auto *data = (std::uint8_t *)VirtualAlloc((void *)scratch_reserve_base(), SCRATCH_DATA_BYTES + (g_page_size * 2), MEM_RESERVE, PAGE_NOACCESS);
-
-    auto release_regions = [&buffer, &stack, &data]() noexcept
-    {
-        VirtualFree(buffer, 0, MEM_RELEASE);
-        VirtualFree(stack, 0, MEM_RELEASE);
-        VirtualFree(data, 0, MEM_RELEASE);
-    };
-
-    if (buffer == nullptr || stack == nullptr || data == nullptr)
-    {
-        release_regions();
-
-        trace.outcome = Outcome::Faulted;
-        trace.message = "VirtualAlloc failed.";
-
-        return trace;
-    }
-
-    auto *code_base = buffer + code_region - code.size();
-
-    // End the committed code pages at a guard so an incomplete instruction cannot consume implicit zero bytes.
-    auto *code_memory  = VirtualAlloc(buffer, code_region, MEM_COMMIT, PAGE_READWRITE);
-    auto *stack_memory = VirtualAlloc(stack + g_page_size, SCRATCH_STACK_BYTES, MEM_COMMIT, PAGE_READWRITE);
-    auto *data_memory  = VirtualAlloc(data + g_page_size, SCRATCH_DATA_BYTES, MEM_COMMIT, PAGE_READWRITE);
-    if (code_memory == nullptr || stack_memory == nullptr || data_memory == nullptr)
-    {
-        release_regions();
-
-        trace.outcome = Outcome::Faulted;
-        trace.message = "VirtualAlloc commit failed.";
-
-        return trace;
-    }
-
-    std::memcpy(code_base, code.data(), code.size());
-
-    DWORD old_protect{};
-    if (VirtualProtect(buffer, code_region, PAGE_EXECUTE_READ, &old_protect) == FALSE)
-    {
-        release_regions();
-
-        trace.outcome = Outcome::Faulted;
-        trace.message = "VirtualProtect failed.";
-
-        return trace;
-    }
-
-    if (FlushInstructionCache(GetCurrentProcess(), code_base, code.size()) == FALSE)
-    {
-        release_regions();
-
-        trace.outcome = Outcome::Faulted;
-        trace.message = "FlushInstructionCache failed.";
-
-        return trace;
-    }
-
-    // Leave the lowest stack page reserved so downward overflow faults immediately.
-    // Start RSP below the top so an empty pop or ret reads committed zeros before leaving the code buffer.
-    auto initial_rsp = (std::uint64_t)(stack + g_page_size + SCRATCH_STACK_BYTES - 0x100) & ~(std::uint64_t)15;
-
-    // The data region is zeroed with one guard page on each side.
-    // RDI and RSI default here so string instructions work without setup. Other registers can use the displayed address.
-    auto data_base     = (std::uint64_t)(data + g_page_size);
-    auto effective_rdi = seed_data_pointers && seed[Reg::RDI] == 0 ? data_base : seed[Reg::RDI];
-    auto effective_rsi = seed_data_pointers && seed[Reg::RSI] == 0 ? data_base : seed[Reg::RSI];
-
-    g_engine               = std::make_unique<Engine>();
-    g_engine->base         = (std::uint64_t)code_base;
-    g_engine->code_length  = code.size();
-    g_engine->max_steps    = std::min(max_steps != 0 ? max_steps : (std::size_t)1, MAX_STEPS_LIMIT);
-    g_engine->previous_rip = g_engine->base;
-
-    g_engine->raw_steps.reserve(g_engine->max_steps);
-
-    // Make the baseline (cursor 0) reflect the real initial machine state.
-    trace.seed[Reg::RSP] = initial_rsp;
-    trace.seed[Reg::RDI] = effective_rdi;
-    trace.seed[Reg::RSI] = effective_rsi;
-    trace.seed[Reg::RIP] = g_engine->base;
-
-    // User status flags + reserved bit 1 + IF.
-    // No TF here. This is the displayed baseline, not the stepping context.
-    trace.seed[Reg::RFLAGS] = (seed[Reg::RFLAGS] & RFLAGS_STATUS_MASK) | RFLAGS_RESERVED_BIT1 | RFLAGS_INTERRUPT_FLAG;
-
-    auto thread = CreateThread(nullptr, 0, sandbox_thread_main, nullptr, CREATE_SUSPENDED, nullptr);
-    if (thread == nullptr)
-    {
-        release_regions();
-
-        g_engine = nullptr;
-
-        trace.outcome = Outcome::Faulted;
-        trace.message = "CreateThread failed.";
-
-        return trace;
-    }
-
-    auto terminate_thread = [thread]() noexcept
-    {
-        if (TerminateThread(thread, 0) != FALSE)
-        {
-            WaitForSingleObject(thread, INFINITE);
-        }
-
-        CloseHandle(thread);
-    };
-
-    g_engine->thread_id = GetThreadId(thread);
-    if (g_engine->thread_id == 0)
-    {
-        terminate_thread();
-        release_regions();
-
-        g_engine = nullptr;
-
-        trace.outcome = Outcome::Faulted;
-        trace.message = "GetThreadId failed.";
-
-        return trace;
-    }
-
-    CONTEXT context{};
-    context.ContextFlags = CONTEXT_ALL;
-    if (GetThreadContext(thread, &context) == FALSE)
-    {
-        terminate_thread();
-        release_regions();
-
-        g_engine = nullptr;
-
-        trace.outcome = Outcome::Faulted;
-        trace.message = "GetThreadContext failed.";
-
-        return trace;
-    }
-
-    // Pristine entry context to bail back to.
-    g_engine->saved_context = context;
-
-    // Capture pristine FPU/SSE state into the baseline.
-    g_engine->snapshot_fpu(&context, trace.seed);
-
-    // Overlay the seeded XMM registers onto both the sandbox context (for execution) and the display baseline.
-    // A fresh thread has zeroed SSE state, so `snapshot_fpu` just captured zeros and any unseeded register stays zero.
-    for (std::size_t i{}; i < trace.seed.xmm.size(); ++i)
-    {
-        trace.seed.xmm[i] = seed.xmm[i];
-
-        context.FltSave.XmmRegisters[i].Low  = seed.xmm[i][0];
-        context.FltSave.XmmRegisters[i].High = (LONGLONG)seed.xmm[i][1];
-    }
-
-    // Overlay seeded x87 registers.
-    // The seed's tag word marks which ST slots the user set. Load each into its physical register with TOP left at 0 (so ST(i) is physical register
-    // i), mark it valid in the tag word, and mirror the value into the baseline.
-    for (std::size_t i{}; i < trace.seed.st.size(); ++i)
-    {
-        if ((seed.fpu_tag_word_abridged >> i & 1) != 0)
-        {
-            trace.seed.st[i] = seed.st[i];
-
-            std::memcpy(&context.FltSave.FloatRegisters[i], seed.st[i].data(), seed.st[i].size());
-
-            context.FltSave.TagWord |= (std::uint8_t)(1 << i);
-        }
-    }
-
-    trace.seed.fpu_tag_word_abridged = context.FltSave.TagWord;
-
-    context.Rax = seed[Reg::RAX];
-    context.Rbx = seed[Reg::RBX];
-    context.Rcx = seed[Reg::RCX];
-    context.Rdx = seed[Reg::RDX];
-    context.Rsi = effective_rsi;
-    context.Rdi = effective_rdi;
-    context.Rbp = seed[Reg::RBP];
-    context.R8  = seed[Reg::R8];
-    context.R9  = seed[Reg::R9];
-    context.R10 = seed[Reg::R10];
-    context.R11 = seed[Reg::R11];
-    context.R12 = seed[Reg::R12];
-    context.R13 = seed[Reg::R13];
-    context.R14 = seed[Reg::R14];
-    context.R15 = seed[Reg::R15];
-
-    // Scratch-stack top.
-    // RSP is engine-controlled (not seedable).
-    context.Rsp = initial_rsp;
-    context.Rip = g_engine->base;
-
-    // Status flags + reserved bit 1 + IF + TF (arms single-stepping).
-    context.EFlags = (DWORD)((seed[Reg::RFLAGS] & RFLAGS_STATUS_MASK) | RFLAGS_RESERVED_BIT1 | RFLAGS_INTERRUPT_FLAG | RFLAGS_TRAP_FLAG);
-
-    if (SetThreadContext(thread, &context) == FALSE)
-    {
-        terminate_thread();
-        release_regions();
-
-        g_engine = nullptr;
-
-        trace.outcome = Outcome::Faulted;
-        trace.message = "SetThreadContext failed.";
-
-        return trace;
-    }
-
-    auto *veh_handle = AddVectoredExceptionHandler(1, bme_veh);
-    if (veh_handle == nullptr)
-    {
-        terminate_thread();
-        release_regions();
-
-        g_engine = nullptr;
-
-        trace.outcome = Outcome::Faulted;
-        trace.message = "Failed to install exception handler.";
-
-        return trace;
-    }
-
-    g_engine->active = true;
-
-    if (ResumeThread(thread) == (DWORD)-1)
-    {
-        g_engine->active = false;
-
-        RemoveVectoredExceptionHandler(veh_handle);
-
-        terminate_thread();
-        release_regions();
-
-        g_engine = nullptr;
-
-        trace.outcome = Outcome::Faulted;
-        trace.message = "ResumeThread failed.";
-
-        return trace;
-    }
-
-    auto wait_result = WaitForSingleObject(thread, INFINITE);
-
-    g_engine->active = false;
-
-    RemoveVectoredExceptionHandler(veh_handle);
-    if (wait_result != WAIT_OBJECT_0)
-    {
-        terminate_thread();
-        release_regions();
-
-        g_engine = nullptr;
-
-        trace.outcome = Outcome::Faulted;
-        trace.message = "WaitForSingleObject failed.";
-
-        return trace;
-    }
-
-    CloseHandle(thread);
-
-    // Pair captured register states with the active decoder's independent instruction layout.
-    trace.steps.reserve(g_engine->raw_steps.size() + (g_engine->outcome == Outcome::Faulted ? 1 : 0));
-
-    for (auto &&raw_step : g_engine->raw_steps)
+    trace.steps.reserve(result.steps.size());
+    for (auto &&platform_step : result.steps)
     {
         auto &step     = trace.steps.emplace_back();
-        step.rip       = raw_step.rip;
-        step.registers = raw_step.registers;
-        step.reached   = true;
+        step.rip       = platform_step.rip;
+        step.registers = platform_step.registers;
+        step.reached   = !platform_step.faulted;
+        step.faulted   = platform_step.faulted;
     }
 
-    if (g_engine->outcome == Outcome::Faulted)
-    {
-        auto &step     = trace.steps.emplace_back();
-        step.rip       = g_engine->fault_address;
-        step.registers = g_engine->fault_registers;
-        step.faulted   = true;
-    }
-
+    // OS execution returns raw snapshots.
+    // Decode them here against the selected backend's instruction layout.
     apply_history_steps(trace, decode_history_steps(trace, backend, syntax));
 
-    trace.outcome = g_engine->outcome;
+    auto executed = std::ranges::count_if(trace.steps, [](const Step &step) { return step.reached; });
 
-    auto executed = g_engine->raw_steps.size();
-
-    switch (g_engine->outcome)
+    switch (trace.outcome)
     {
     case Outcome::Stopped:
     {
-        trace.message      = fmt::format("Stopped at int3 (0x{:X}) - {} executed.", g_engine->fault_address, executed);
+        trace.message      = fmt::format("Stopped at int3 (0x{:X}) - {} executed.", result.stop_address, executed);
         trace.stop_reason  = "Stopped here - int3 breakpoint";
-        trace.stop_address = g_engine->fault_address;
+        trace.stop_address = result.stop_address;
 
         break;
     }
 
     case Outcome::Faulted:
     {
-        trace.message      = fmt::format("{} at 0x{:X} ({} executed).", fault_name(g_engine->fault_code), g_engine->fault_address, executed);
-        trace.stop_reason  = fmt::format("Faulted here - {}", fault_name(g_engine->fault_code));
-        trace.stop_address = g_engine->fault_address;
+        trace.message      = fmt::format("{} at 0x{:X} ({} executed).", result.fault_name, result.stop_address, executed);
+        trace.stop_reason  = fmt::format("Faulted here - {}", result.fault_name);
+        trace.stop_address = result.stop_address;
 
         break;
     }
 
     case Outcome::AbortedCap:
     {
-        trace.message     = fmt::format("Hit step cap ({} executed).", g_engine->max_steps);
+        trace.message     = fmt::format("Hit step cap ({} executed).", max_steps != 0 ? std::min(max_steps, MAX_STEPS_LIMIT) : (std::size_t)1);
         trace.stop_reason = "Not reached - Step cap reached";
 
         break;
@@ -2031,12 +1295,6 @@ Trace run_engine(
     }
     }
 
-    VirtualFree(buffer, 0, MEM_RELEASE);
-    VirtualFree(stack, 0, MEM_RELEASE);
-    VirtualFree(data, 0, MEM_RELEASE);
-
-    g_engine = nullptr;
-
     return trace;
 }
 
@@ -2045,6 +1303,9 @@ void redisasm(Trace &trace, DisasmBackend backend, DisasmSyntax syntax) noexcept
 {
     apply_history_steps(trace, decode_history_steps(trace, backend, syntax));
 }
+
+namespace
+{
 
 struct UI
 {
@@ -2092,7 +1353,7 @@ private:
     std::int32_t &m_offset;
 
 public:
-    ScrollViewport(ftxui::Element child, std::int32_t &offset) noexcept : Node{ftxui::Elements{std::move(child)}}, m_offset{offset} {}
+    ScrollViewport(ftxui::Element child, std::int32_t &offset) : Node{ftxui::Elements{std::move(child)}}, m_offset{offset} {}
 
     void SetBox(ftxui::Box box) override
     {
@@ -2117,6 +1378,7 @@ public:
     {
         // Clip to our box so the taller child does not draw over the toggle above or the panels beside it.
         ftxui::AutoReset stencil(&screen.stencil, ftxui::Box::Intersection(box_, screen.stencil));
+
         children_[0]->Render(screen);
     }
 };
@@ -2172,6 +1434,8 @@ public:
 
 auto make_focus_sink() { return ftxui::Make<FocusSink>(); }
 
+} // namespace
+
 // Composes a 64-bit seed from the per-slice text.
 // The widest non-empty field is the base, each narrower non-empty field overlays its bits (EAX refines RAX, AL refines AX, and so on). Empty fields
 // are ignored. A malformed field is skipped (its bits stay whatever the wider field set, never zeroed over) and appended to `errors` as "{label}:
@@ -2180,7 +1444,7 @@ std::uint64_t compose_gpr_seed(const GPRSeed &seed, std::string_view label, std:
 {
     std::uint64_t result{};
 
-    auto overlay = [&](std::string_view text, std::uint64_t mask, std::int32_t shift)
+    auto overlay = [&result, &errors, &label](std::string_view text, std::uint64_t mask, std::int32_t shift)
     {
         if (text.empty())
         {
@@ -2315,11 +1579,14 @@ const auto &history_state_at(const UI &ui, std::size_t position) noexcept
 
 struct HistorySelection
 {
+    // Row identity.
     std::uint64_t rip{};
     std::size_t   execution_position{};
-    bool          has_step{};
-    bool          reached{};
-    bool          faulted{};
+
+    // Execution state.
+    bool has_step{};
+    bool reached{};
+    bool faulted{};
 };
 
 auto history_selection(const UI &ui, std::int32_t tab) noexcept
@@ -2535,7 +1802,7 @@ std::int32_t run_tui(const CLI &cli)
         ui.cursor = 0;
     };
 
-    auto reset = [&ui]() noexcept
+    auto reset = [&ui]
     {
         ui.trace                = {};
         ui.history              = {"- (No trace - Press Run)"};
@@ -2721,11 +1988,11 @@ std::int32_t run_tui(const CLI &cli)
     ftxui::Box syntax_button_box{};
     ftxui::Box backend_button_box{};
 
-    auto rightclick_back = [](ftxui::Component button, ftxui::Box *box, auto back) noexcept
+    auto rightclick_back = [](ftxui::Component button, ftxui::Box *box, auto on_back) noexcept
     {
         return ftxui::CatchEvent(
             std::move(button),
-            [box, back = std::move(back)](ftxui::Event event)
+            [box, on_back = std::move(on_back)](ftxui::Event event)
             {
                 if (event.is_mouse()
                     && event.mouse().button
@@ -2734,7 +2001,7 @@ std::int32_t run_tui(const CLI &cli)
                     == ftxui::Mouse::Pressed
                     && box->Contain(event.mouse().x, event.mouse().y))
                 {
-                    back();
+                    on_back();
 
                     return true;
                 }
@@ -2974,7 +2241,7 @@ std::int32_t run_tui(const CLI &cli)
 
     std::vector<FlagHit> flag_hits{};
 
-    auto render_flags = [&ui, &flag_hits] noexcept
+    auto render_flags = [&ui, &flag_hits]
     {
         flag_hits.clear();
         flag_hits.reserve(STATUS_FLAGS.size());
@@ -3162,8 +2429,8 @@ std::int32_t run_tui(const CLI &cli)
             // `st[i]` is already stack-relative (slot 0 = ST0).
             // TOP only maps ST(i) to its physical x87 register and (physical-ordered) tag bit.
             auto       &register_bytes    = current.st[(std::size_t)i];
-            auto        physical          = top_current + i & 7;
-            auto        previous_physical = top_previous + i & 7;
+            auto        physical          = (top_current + i) & 7;
+            auto        previous_physical = (top_previous + i) & 7;
             auto        occupied          = has_trace && (current.fpu_tag_word_abridged >> physical & 1) != 0;
             auto        previous_occupied = has_trace && (previous.fpu_tag_word_abridged >> previous_physical & 1) != 0;
             std::string tag               = "-";
@@ -3544,7 +2811,7 @@ std::int32_t run_tui(const CLI &cli)
         about_ok,
         [&about_ok]
         {
-            auto field = [](std::string_view label, std::string_view value) noexcept
+            auto field = [](std::string_view label, std::string_view value)
             {
                 return ftxui::hbox({
                     ftxui::text(label) | ftxui::dim | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, 11),
@@ -3705,8 +2972,8 @@ std::int32_t run_quick(const CLI &cli)
     {
         // Indented, fmt-padded delta line.
         // `<label> <before> -> <after><extra>`.
-        auto row = [](std::string_view label, std::string_view before, std::string_view after, std::string_view extra = "")
-        { fmt::println("{:6}{:<6} {} -> {}{}", "", label, before, after, extra); };
+        auto row = [](std::string_view label, std::string_view before_text, std::string_view after_text, std::string_view extra = "")
+        { fmt::println("{:6}{:<6} {} -> {}{}", "", label, before_text, after_text, extra); };
 
         if (track.gpr)
         {
