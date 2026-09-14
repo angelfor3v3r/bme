@@ -136,7 +136,7 @@ jobs:
             printf "%s\n" "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/bookworm/ llvm-toolchain-bookworm-22 main" > /etc/apt/sources.list.d/llvm.list
             apt-get update
             apt-get install -y clang-22 lld-22
-            python3 -m pip install --break-system-packages cmake==3.31.6
+            python3 -m pip install --break-system-packages cmake==3.31.10
             cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 -DBME_BUILD_TESTS=ON
             cmake --build build --parallel
             version_output=$(./build/bme --version)
