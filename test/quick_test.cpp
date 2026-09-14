@@ -1,4 +1,9 @@
+#include "common.hpp"
 #include "test_helpers.hpp"
+
+#if BME_OS_LINUX
+#include <cstdlib>
+#endif
 
 #include <string>
 
@@ -51,3 +56,15 @@ TEST(RunQuickErrors, BadBytes)
     EXPECT_EQ(capture.return_code, 1);
     EXPECT_NE(capture.err.find("Error"), std::string::npos);
 }
+
+#if BME_OS_LINUX
+TEST(RunQuickFpuDeathTest, UnmaskedX87ExceptionsDoNotTerminateFormatter)
+{
+    auto cli = parse_cli({"--bytes", "D92FD9EB", "--quick", "--track", "x87"});
+    ASSERT_TRUE(cli.has_value());
+
+    // `EXPECT_EXIT` isolates a possible `SIGFPE`.
+    // `std::_Exit` ends its child without running inherited cleanup.
+    EXPECT_EXIT(std::_Exit(run_quick(*cli)), testing::ExitedWithCode(0), "");
+}
+#endif

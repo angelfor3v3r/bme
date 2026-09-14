@@ -521,7 +521,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     {
         release_regions();
 
-        result.outcome = Outcome::Faulted;
+        result.outcome = Outcome::Error;
         result.error   = std::move(error);
 
         return result;
@@ -596,7 +596,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
 
         g_engine = nullptr;
 
-        result.outcome = Outcome::Faulted;
+        result.outcome = Outcome::Error;
         result.error   = std::move(error);
 
         return result;
@@ -615,7 +615,15 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
         return fail_thread("GetThreadContext failed.");
     }
 
+    // Preserve the original startup context before applying the sandbox seed.
     g_engine->saved_context = context;
+
+    context.FltSave.ControlWord = DEFAULT_FPU_CONTROL_WORD;
+    context.FltSave.StatusWord  = 0;
+    context.FltSave.TagWord     = 0;
+    context.FltSave.MxCsr       = DEFAULT_MXCSR;
+    context.MxCsr               = DEFAULT_MXCSR;
+
     g_engine->snapshot_fpu(&context, result.seed);
 
     for (std::size_t i{}; i < result.seed.xmm.size(); ++i)

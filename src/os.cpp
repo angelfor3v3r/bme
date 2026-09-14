@@ -17,9 +17,9 @@ bool prepare_platform_run(const PlatformRunRequest &request, PlatformRunResult &
 
     if (instrumentation_detected())
     {
-        result.outcome                  = Outcome::Faulted;
+        result.outcome                  = Outcome::Error;
         result.instrumentation_detected = true;
-        result.error                    = "Running under an emulator or instrumentation layer. Native single-step tracing is unavailable.";
+        result.error                    = INSTRUMENTATION_REFUSAL;
 
         return false;
     }

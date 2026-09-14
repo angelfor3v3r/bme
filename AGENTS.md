@@ -14,7 +14,7 @@ RFLAGS, XMM, and x87 state change one instruction at a time.
   resolved statically), and some encodings have generation-specific meanings, so identical bytes can
   represent different instructions on different processors.
 - **Platform** - Windows and Linux, x86-64 only. CMake hard-errors otherwise.
-- **Sandbox model** - Windows reserves guarded mappings and single-steps a sandbox thread with a Vectored Exception Handler. Linux reserves the same mappings in a traced child and uses `PTRACE_SINGLESTEP`. Both capture GPR, RFLAGS, XMM, and x87 state after each completed instruction. Faults, `int3`, and runaway loops are contained and surfaced in the UI rather than crashing the host.
+- **Sandbox model** - Windows reserves guarded mappings and single-steps a sandbox thread with a Vectored Exception Handler. Linux reserves the same mappings in a traced child and uses `PTRACE_SINGLESTEP`. Both capture GPR, RFLAGS, XMM, and x87 state after each completed instruction. Faults, `int3`, and runaway loops are contained and surfaced in the UI rather than crashing the host. Detected Intel SDE or Pin instrumentation prevents execution because native single-step state cannot be trusted.
 - The sandbox contains faults and runaway loops, not hostile code. Executed bytes retain user
   privileges and can issue system calls or modify process state.
 - Decode is pluggable (`DisasmBackend`) - **Zydis** (default), **bddisasm**, **Capstone**, or **XED**. TUI via FTXUI, CLI via argparse, formatting via fmt.
@@ -72,6 +72,12 @@ Intel XED (`v2026.08.23` plus its mbuild) has no CMake, so CPM downloads it and 
 builds it via `mfile.py` (`cmake/XED.cmake`) - needs Python 3.
 All slow on first configure.
 
+CI is the authoritative formatting check. Contributors may enable the tracked pre-commit hook explicitly:
+
+```sh
+git config core.hooksPath .githooks
+```
+
 - C++23. Clang and GCC warn with `-Wall -Wextra -Wshadow -Wpedantic`. clang-cl / MSVC cl use `/W4 /permissive-`. Codegen is pinned to baseline **x86-64** (SSE2, no AVX - `-march=x86-64`, or cl's immutable x64 default) so `bme` runs on any x86-64 CPU.
 - `-Werror` / `/WX` only when `CI` env var is set (toolchain pinned there).
   Locally you see warnings but they don't block.
@@ -90,9 +96,9 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-- The `bme_core` split exists for this. The static lib (`namespace bme`) holds all logic, so tests link it and call parser, seed-composition, CLI, environment, quick error-path utilities, and focused engine orchestration contracts directly. `bme_tests` links `bme_core` + `GTest::gtest` with a custom `main` (`test/main.cpp`) that calls `bme::init`. It is exempt from `-Werror` so GoogleTest macros can't fail the CI build.
+- The `bme_core` split exists for this. The static lib (`namespace bme`) holds all logic, so tests link it and call parser, seed-composition, CLI, environment, instrumentation preflight, quick error-path utilities, and focused engine orchestration contracts directly. `bme_tests` links `bme_core` + `GTest::gtest` with a custom `main` (`test/main.cpp`) that calls `bme::init`. It is exempt from `-Werror` so GoogleTest macros can't fail the CI build.
 - `test/test_helpers.hpp` holds only the shared CLI argument builder and stdout/stderr capture used by utility tests.
-- Scope. Test BME behavior that we own. Engine tests cover orchestration such as fault-state classification and concurrent-call isolation. Do not assert decoder correctness, CPU instruction semantics, ASLR-dependent registers, or decoder-specific text.
+- Scope. Test BME behavior that we own. Engine tests cover orchestration such as fault-state classification, instrumentation refusal, and concurrent-call isolation. Do not assert decoder correctness, CPU instruction semantics, ASLR-dependent registers, or decoder-specific text.
 - Keep engine cases bounded to safe byte sequences and stable architectural outcomes.
 
 ## Code style - load-bearing, the user cares a LOT
@@ -114,10 +120,7 @@ These were corrected repeatedly across the session. Match them exactly.
   right one per site. No redundant parentheses around bitwise ops.
 - **Verbose names** in both source and GUI, single-letter only for trivial loop
   counters (`i`). No cryptic abbreviations (`fcw` -> `fpu_control_word`, etc).
-- **`noexcept` only where genuinely justified.** Fine on genuinely no-throw code and bounded
-  `std::string`/`std::vector` paths whose only realistic failure is allocation, including
-  `disasm_one`, `decode_history_steps`, `apply_history_steps`, and `redisasm`. Never use it when
-  the call graph reaches `fmt::format` or `fmt::println`; `fmt` can throw `format_error`.
+- **`noexcept` only where genuinely justified.** Every callee must be nonthrowing. Never use it around allocation-capable string or vector work, `fmt`, or component insertion.
 - GUI register names uppercased accurately (`RAX`, `RFLAGS`).
 - **Comment punctuation.** Code-comment prose is plain ASCII. No `;`, no `:`, and no ` - ` as clause separators, and no unicode. MASM's required leading `;` marker is exempt.
   Use periods or commas. Hyphens inside words, code tokens, and `->` are allowed.
@@ -126,7 +129,7 @@ These were corrected repeatedly across the session. Match them exactly.
 clang-format config is settled (clang-format 22, tweaked with braced-list breaking,
 function-arg vertical compounding, `NumericLiteralCase`
 lower/upper/lower/lower, binary-op breaking `NonAssignment`/`OnePerLine`).
-Don't reformat by hand - the pre-commit hook + CI enforce it.
+Don't reformat by hand. Clang-format 22 and CI are authoritative. The optional pre-commit hook checks staged C++ files.
 Never run clang-format on `src/st80.asm` or `src/st80.S`.
 
 ## Key internals
@@ -138,16 +141,17 @@ Never run clang-format on `src/st80.asm` or `src/st80.S`.
 - `Step` - rip, bytes, disasm `text`, and `registers`. `reached` marks a completed instruction,
   `faulted` marks a faulting instruction whose registers are exception-time partial state, and neither
   marks static disassembly that never executed. `data` identifies raw "(data)" bytes.
-- `Trace` - seed, original code, steps, `Outcome` (Idle/Finished/Faulted/AbortedCap/Stopped), and status
-  `message`. `stop_reason` labels stop, fault, or not-reached rows. `stop_address` anchors an `int3` or
-  fault to its instruction address.
-- Platform execution lives behind the private `os.hpp` contract. `os.cpp` handles shared preflight.
+- `Trace` - seed, original code, steps, `Outcome` (Idle/Error/Finished/Faulted/AbortedCap/Stopped), and status
+  `message`. `Error` identifies engine or instrumentation failure, while `Faulted` identifies a fault raised
+  by the supplied bytes. `stop_reason` labels stop, fault, or not-reached rows. `stop_address` anchors an `int3` or fault to its instruction address.
+- Platform execution lives behind the private `os.hpp` contract. `os.cpp` handles shared preflight,
+  including copying the requested seed and refusing execution when instrumentation is detected.
   Windows uses guarded `VirtualAlloc` mappings and a VEH sandbox thread. Linux uses guarded `mmap`
-  mappings and a traced child with `PTRACE_SINGLESTEP` plus `PTRACE_GETFPREGS` for XMM and x87 state.
+  mappings and a traced child with `PTRACE_SINGLESTEP`, `PTRACE_O_EXITKILL`, and `PTRACE_GETFPREGS`.
   Both platforms use guarded 64 KiB scratch stack and data regions. The data mapping reserves at
   `SCRATCH_DATA_RESERVE_BASE`, never relocates, and exposes usable bytes one guard page above it.
   RDI and RSI default to that usable address unless seeded. The step cap defaults to 50k and clamps
-  to `MAX_STEPS_LIMIT`.
+  to `MAX_STEPS_LIMIT`, but it does not bound wall-clock time. A blocking system call can stall a run.
 - Linux asks Zydis to identify software-breakpoint instructions only after ptrace reports a breakpoint-class `SIGTRAP`. This avoids handwritten x86 parsing and distinguishes WSL2's ambiguous syscall completion trap. The runtime check does not use the selected display backend.
 - `parse_hex` (`std::from_chars`, `Result`/`std::expected`-based), `parse_seed`.
 - Decode backends (`DisasmBackend`). `disasm_one(backend, syntax, addr, code, size)` -> `Decoded`
@@ -171,9 +175,11 @@ Never run clang-format on `src/st80.asm` or `src/st80.S`.
   or a decimal with a `.` or a non-finite `inf`/`nan` value, and an optional trailing `f`/`F` (single
   precision) or `l`/`L`/none (double), via `parse_decimal_seed`.
   XMM places single in the low 32 bits (f32x4 lane 0) and double in the low 64 bits (f64x2 lane 0).
-  x87 rounds the value to 80-bit via `double_to_st80`. The platform backends seed XMM and x87 into
-  the native context, establish `TOP` 0, and mark seeded x87 slots non-empty. Windows uses
-  `FltSave`; Linux uses `user_fpregs_struct`.
+  x87 rounds the value to 80-bit via `double_to_st80`. Both backends begin with the x87 reset
+  control, status, and tag state plus `MXCSR` `0x1F80`, then apply XMM and x87 seeds to the native
+  context, establish `TOP` 0, and mark seeded x87 slots non-empty. Windows uses `FltSave`; Linux uses
+  `user_fpregs_struct`.
+  The x87 conversion leaves preserve the caller's control word and apply only the captured rounding-control bits.
   `render_xmm` always shows the `f64x2` decimal row when a trace exists, with
   `f32x4` behind the click-to-expand toggle (`ui.xmm_expand`), each lane its own `copy_cell`.
   `render_x87` mirrors this with a per-ST `f32` (Real4) narrowed row behind `ui.st_expand`.
@@ -297,7 +303,7 @@ options" error. Keep that ordering.
 - Owner - **angelfor3v3r** (Dexxi). Repo `github.com/angelfor3v3r/bme`.
 - License - **MIT** © angelfor3v3r (Dexxi). Keep `BME_COPYRIGHT` in `bme_core.cpp`,
   LICENSE, and the About box in sync.
-- Versioning - SemVer tags. The public release line starts at `v1.0.0`. `--version` resolves git tag/hash
+- Versioning - stable SemVer tags use `vMAJOR.MINOR.PATCH`. The public release line starts at `v1.0.0`. `--version` resolves git tag/hash
   via `cmake/GenerateVersion.cmake` -> generated `bme_version.hpp` (build-time regen, recompiles only
   when tag/hash move). Source builds show branch.
 

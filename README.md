@@ -30,7 +30,7 @@ decoders can disagree on the same bytes. Executing on real silicon (and swapping
 - Click any register value (GPR, XMM, MXCSR, x87, or an individual float in a drill-down) to copy it to the clipboard
 - Keyboard shortcuts. **F5** run, **F8** step, **F7** back
 - Headless `--quick` dump - print the trace (per-instruction register deltas) to stdout, no TUI
-- Detects Intel SDE and Pin instrumentation from environment markers. Windows also checks parent processes and loaded modules
+- Detects Intel SDE and Pin instrumentation from environment markers. Windows also checks parent processes and loaded modules. Execution is refused because instrumented single-step state cannot be trusted
 - History panel has a `Main` tab plus one tab per decoder (`zydis`, `bddisasm`, `capstone`, `xed`). Each backend applies its own instruction boundaries to the original bytes without re-running the code
 
 ## Usage
@@ -40,7 +40,7 @@ bytes, **Run** (or **F5**), and **Step** / **Back** (**F8** / **F7**) through th
 x87 registers in the left panels and status flags by clicking the Flags panel. **Settings** holds the
 disasm syntax, step cap, and whether RDI/RSI point at the scratch data. **About** shows the build.
 
-The sandbox contains faults and runaway loops, but it is not a security boundary. Run only trusted machine code.
+The sandbox contains common faults and instruction-count runaways, but it is not a security boundary. Windows executes bytes in a host-process thread. Linux uses a traced child process. Executed bytes retain user privileges and may invoke system calls or modify process state. Run only trusted machine code. The step cap is not a wall-clock deadline, so a blocking system call can stall a run. BME refuses execution when it detects Intel SDE or Pin instrumentation.
 
 ```sh
 bme                                      # open the TUI empty
@@ -97,9 +97,19 @@ cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++
 cmake --build build
 ```
 
+### Formatting
+
+CI is the authoritative formatting check. Contributors can optionally enable the tracked pre-commit hook:
+
+```sh
+git config core.hooksPath .githooks
+```
+
 Prebuilt binaries and packages are on the [Releases](https://github.com/angelfor3v3r/bme/releases) page.
 
 ## Packages
+
+Release builds provide a versioned Windows ZIP containing `bme.exe`, `LICENSE`, and `THIRD_PARTY_LICENSES.md`.
 
 CPack generates a Debian package plus a `.tar.gz` archive on Linux.
 
@@ -111,7 +121,7 @@ Both package formats include BME's license and the bundled third-party license t
 
 ## Tests
 
-Unit tests cover BME-owned behavior including parsing, seed composition, CLI handling, environment handling, bounded engine execution, fault-state capture, and `--quick` errors. Decoder correctness remains outside the unit-test contract. Off by default.
+Unit tests cover BME-owned behavior including parsing, seed composition, CLI handling, environment handling, instrumentation refusal, bounded engine execution, fault-state capture, and `--quick` errors. Decoder correctness remains outside the unit-test contract. Off by default.
 
 ```sh
 cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBME_BUILD_TESTS=ON

@@ -42,9 +42,9 @@ enum class Reg : std::uint8_t
 };
 
 constexpr auto        REG_COUNT = (std::size_t)Reg::RFLAGS + 1;
-constexpr std::size_t GPR_COUNT = 16; // RAX..R15. RSP is engine-controlled and not user-seedable, see below.
+constexpr std::size_t GPR_COUNT = 16; // `RAX..R15`. `RSP` is engine-controlled and not user-seedable, see below.
 
-// The x86 RFLAGS bits we expose, the six arithmetic status flags plus DF (the direction flag).
+// The x86 `RFLAGS` bits we expose, the six arithmetic status flags plus `DF` (the direction flag).
 enum Flag : std::uint64_t
 {
     CF = 1ull << 0,
@@ -59,6 +59,7 @@ enum Flag : std::uint64_t
 enum class Outcome : std::uint8_t
 {
     Idle = 0,
+    Error,
     Finished,
     Faulted,
     AbortedCap,
@@ -91,11 +92,11 @@ struct TrackMask
 
 struct GPRSeed
 {
-    std::string full{};      // 64-bit (RAX..R15).
-    std::string dword{};     // Low 32 bits (EAX..).
-    std::string word{};      // Low 16 bits (AX..).
-    std::string byte_high{}; // Bits 8..15 (AH/BH/CH/DH. First four GPRs only).
-    std::string byte_low{};  // Low 8 bits (AL..).
+    std::string full{};      // 64-bit (`RAX..R15`).
+    std::string dword{};     // Low 32 bits (`EAX..`).
+    std::string word{};      // Low 16 bits (`AX..`).
+    std::string byte_high{}; // Bits 8..15 (`AH`/`BH`/`CH`/`DH`). First four GPRs only.
+    std::string byte_low{};  // Low 8 bits (`AL..`).
 };
 
 // A decimal seed value, plus whether it carried an `f`/`F` (single-precision) suffix.
@@ -128,19 +129,19 @@ struct Registers
     }
 
     // Integer state.
-    std::array<std::uint64_t, GPR_COUNT> gpr{};    // RAX..R15.
+    std::array<std::uint64_t, GPR_COUNT> gpr{};    // `RAX..R15`.
     std::uint64_t                        rip{};    // Instruction pointer.
     std::uint64_t                        rflags{}; // Flags register.
 
     // SSE state.
-    std::array<std::array<std::uint64_t, 2>, 16> xmm{};   // XMM0..15 as {lo, hi}.
+    std::array<std::array<std::uint64_t, 2>, 16> xmm{};   // `XMM0..XMM15` as `{lo, hi}`.
     std::uint32_t                                mxcsr{}; // SSE control/status.
 
     // x87 state.
-    std::array<std::array<std::uint8_t, 10>, 8> st{};                    // Stack-relative ST(0)..ST(7), each 80-bit.
+    std::array<std::array<std::uint8_t, 10>, 8> st{};                    // Stack-relative `ST(0)..ST(7)`, each 80-bit.
     std::uint16_t                               fpu_control_word{};      // x87 control word.
     std::uint16_t                               fpu_status_word{};       // x87 status word.
-    std::uint8_t                                fpu_tag_word_abridged{}; // FXSAVE abridged tag (1 bit/reg), not the 16-bit x87 tag word.
+    std::uint8_t                                fpu_tag_word_abridged{}; // `FXSAVE` abridged tag (1 bit/reg), not the 16-bit x87 tag word.
 };
 
 struct Step
@@ -169,9 +170,9 @@ struct Trace
     // Outcome.
     Outcome       outcome = Outcome::Idle;
     std::string   message{};
-    bool          emulator_detected{}; // Native TF context was not safe to trust.
-    std::string   stop_reason{};       // Reason execution halted (labels the stop instruction).
-    std::uint64_t stop_address{};      // Address of the stop instruction (int3/fault), 0 otherwise.
+    bool          instrumentation_detected{}; // Platform tracing was refused because instrumentation was detected.
+    std::string   stop_reason{};              // Reason execution halted (labels the stop instruction).
+    std::uint64_t stop_address{};             // Address of the stop instruction (int3/fault), 0 otherwise.
 };
 
 struct CLI
@@ -220,7 +221,7 @@ Trace run_engine(
     std::span<std::uint8_t> code, const Registers &seed, std::size_t max_steps, DisasmBackend backend, DisasmSyntax syntax, bool seed_data_pointers
 );
 
-void redisasm(Trace &trace, DisasmBackend backend, DisasmSyntax syntax) noexcept;
+void redisasm(Trace &trace, DisasmBackend backend, DisasmSyntax syntax);
 
 std::int32_t run_quick(const CLI &cli);
 std::int32_t run_tui(const CLI &cli);

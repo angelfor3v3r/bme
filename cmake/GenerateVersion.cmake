@@ -1,7 +1,9 @@
 # Resolves git version metadata and writes the version header.
-# Run via `cmake -P`. Inputs passed with -D (GIT_EXECUTABLE, SRC_DIR, IN, OUT).
-# BME_GIT_TAG = exact tag if HEAD is a cut release, else the current branch (source build).
+# Run via `cmake -P`. Inputs use `-D` with `GIT_EXECUTABLE`, `SRC_DIR`, `IN`, and `OUT`.
+# `BME_GIT_TAG` is the exact tag when `HEAD` is a release, otherwise the current branch.
+# `BME_GIT_EXACT_TAG` is true only when `HEAD` has an exact tag.
 set(BME_GIT_TAG "unknown")
+set(BME_GIT_EXACT_TAG OFF)
 set(BME_GIT_HASH "unknown")
 set(BME_GIT_URL "https://github.com/angelfor3v3r/bme")
 
@@ -16,6 +18,7 @@ if (GIT_EXECUTABLE AND EXISTS "${SRC_DIR}/.git")
 
     if (BME_EXACT_TAG_RESULT EQUAL 0 AND BME_EXACT_TAG)
         set(BME_GIT_TAG "${BME_EXACT_TAG}")
+        set(BME_GIT_EXACT_TAG ON)
     else ()
         execute_process(
             COMMAND "${GIT_EXECUTABLE}" rev-parse --abbrev-ref HEAD
@@ -51,7 +54,7 @@ if (GIT_EXECUTABLE AND EXISTS "${SRC_DIR}/.git")
 
     # Normalize the `origin` remote to a browseable URL (keeps the hardcoded default if there's no remote).
     if (BME_GIT_REMOTE)
-        # ssh -> https.
+        # `ssh` -> `https`.
         string(REGEX REPLACE "^git@([^:]+):" "https://\\1/" BME_GIT_URL "${BME_GIT_REMOTE}")
 
         # Drop `.git`.
@@ -59,5 +62,5 @@ if (GIT_EXECUTABLE AND EXISTS "${SRC_DIR}/.git")
     endif ()
 endif ()
 
-# Only rewrites OUT when the contents change, so dependents recompile only when the version moves.
+# Only rewrites `OUT` when the contents change, so dependents recompile only when the version moves.
 configure_file("${IN}" "${OUT}" @ONLY)

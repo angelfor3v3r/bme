@@ -36,7 +36,7 @@ struct QuickCapture
 };
 
 // Run `run_quick`, capturing stdout and stderr.
-// `std::fflush` forces fmt output to the captured descriptors before they are read back.
+// `std::fflush` forces `fmt` output to the captured descriptors before they are read back.
 inline auto run_quick_capture(const CLI &cli)
 {
     testing::internal::CaptureStdout();

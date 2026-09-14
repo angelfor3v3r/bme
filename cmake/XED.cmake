@@ -1,8 +1,8 @@
 # Intel XED decoder backend.
 #
 # XED has no native CMake.
-# CPM downloads its sources plus `intelxed/mbuild`, an ExternalProject drives
-# `mfile.py` to build a static library, and we expose it as the IMPORTED target `xed`. Needs Python 3 at build time.
+# CPM downloads its sources plus `intelxed/mbuild`, an `ExternalProject` drives `mfile.py` to build a static
+# library, and we expose it as the `IMPORTED` target `xed`. Needs Python 3 at build time.
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 if (CMAKE_CONFIGURATION_TYPES)
@@ -10,7 +10,7 @@ if (CMAKE_CONFIGURATION_TYPES)
 endif ()
 
 # Download-only.
-# XED has no CMakeLists to add_subdirectory, we just need the sources.
+# XED has no `CMakeLists.txt` to pass to `add_subdirectory`, we just need the sources.
 CPMAddPackage(URI "gh:intelxed/xed#0bcb6237345c5066726dcc08b3d87928df3b5b26" DOWNLOAD_ONLY YES) # v2026.08.23
 CPMAddPackage(URI "gh:intelxed/mbuild#1b437e409221a2b5703b4d8896baa20d43e4ba1a" DOWNLOAD_ONLY YES) # v2026.08.23
 
@@ -48,7 +48,7 @@ if (BME_OS_WINDOWS)
         "--install-dir=${XED_KIT}"
         install)
 else ()
-    # The GNU mbuild path emits the normal Unix static library.
+    # The GNU `mbuild` path emits the normal Unix static library.
     set(XED_LIBRARY "${XED_KIT}/lib/libxed.a")
     set(XED_BUILD_COMMAND
         "${CMAKE_COMMAND}" -E env "PYTHONPATH=${mbuild_SOURCE_DIR}"
@@ -63,7 +63,7 @@ else ()
 endif ()
 
 # `install` assembles a kit.
-# Headers land under include/xed and the static library under lib/.
+# Headers land under `include/xed` and the static library under `lib/`.
 ExternalProject_Add(xed_build
     SOURCE_DIR "${xed_SOURCE_DIR}"
     CONFIGURE_COMMAND ""
@@ -73,8 +73,8 @@ ExternalProject_Add(xed_build
     BUILD_BYPRODUCTS "${XED_LIBRARY}"
     USES_TERMINAL_BUILD TRUE)
 
-# IMPORTED target.
-# Include dirs from IMPORTED targets are treated as SYSTEM automatically, so XED's headers never trip our -Werror.
+# `IMPORTED` target.
+# Include dirs from `IMPORTED` targets are treated as `SYSTEM` automatically, so XED's headers never trip our `-Werror`.
 # The include dir must exist at configure time.
 file(MAKE_DIRECTORY "${XED_INCLUDE_DIR}")
 add_library(xed STATIC IMPORTED GLOBAL)
