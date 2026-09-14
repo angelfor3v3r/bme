@@ -11,9 +11,12 @@ enum class VMProtection : std::uint8_t
     ExecuteRead,
 };
 
-constexpr std::size_t   SCRATCH_STACK_BYTES       = 0x10000;
-constexpr std::size_t   SCRATCH_DATA_BYTES        = 0x10000;
-constexpr std::uint64_t SCRATCH_DATA_RESERVE_BASE = 0x1000'0000;
+constexpr std::size_t      SCRATCH_STACK_BYTES       = 0x10000;
+constexpr std::size_t      SCRATCH_DATA_BYTES        = 0x10000;
+constexpr std::uint64_t    SCRATCH_DATA_RESERVE_BASE = 0x1000'0000;
+constexpr std::uint16_t    DEFAULT_FPU_CONTROL_WORD  = 0x037F;
+constexpr std::uint32_t    DEFAULT_MXCSR             = 0x1F80;
+constexpr std::string_view INSTRUMENTATION_REFUSAL = "Running under an emulator or instrumentation layer. Native single-step tracing is unavailable.";
 
 constexpr auto          RFLAGS_STATUS_MASK    = CF | PF | AF | ZF | SF | DF | OF;
 constexpr std::uint64_t RFLAGS_TRAP_FLAG      = 0x100;

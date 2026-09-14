@@ -5,7 +5,11 @@
 st80_to_double:
     subq $24, %rsp
     fnstcw (%rsp)
-    movw %si, 2(%rsp)
+    movw (%rsp), %ax
+    andw $0xF3FF, %ax
+    andw $0x0C00, %si
+    orw %si, %ax
+    movw %ax, 2(%rsp)
     fldcw 2(%rsp)
     fldt (%rdi)
     fstpl 8(%rsp)
@@ -29,7 +33,11 @@ double_to_st80:
 st80_to_float:
     subq $24, %rsp
     fnstcw (%rsp)
-    movw %si, 2(%rsp)
+    movw (%rsp), %ax
+    andw $0xF3FF, %ax
+    andw $0x0C00, %si
+    orw %si, %ax
+    movw %ax, 2(%rsp)
     fldcw 2(%rsp)
     fldt (%rdi)
     fstps 8(%rsp)

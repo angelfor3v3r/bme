@@ -16,7 +16,7 @@ set(BME_VERSION_ARGS
     "-DIN=${CMAKE_CURRENT_SOURCE_DIR}/cmake/bme_version.hpp.in"
     "-DOUT=${BME_VERSION_HEADER}")
 
-block(PROPAGATE BME_GIT_TAG)
+block(PROPAGATE BME_GIT_TAG BME_GIT_EXACT_TAG)
     set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
     set(IN "${CMAKE_CURRENT_SOURCE_DIR}/cmake/bme_version.hpp.in")
     set(OUT "${BME_VERSION_HEADER}")
@@ -24,8 +24,12 @@ block(PROPAGATE BME_GIT_TAG)
 endblock()
 
 set(BME_PROJECT_VERSION "1.0.0")
-if (BME_GIT_TAG MATCHES "^v([0-9]+\\.[0-9]+\\.[0-9]+)$")
-    set(BME_PROJECT_VERSION "${CMAKE_MATCH_1}")
+if (BME_GIT_EXACT_TAG)
+    if (BME_GIT_TAG MATCHES "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")
+        set(BME_PROJECT_VERSION "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3}")
+    else ()
+        message(FATAL_ERROR "Unsupported release tag `${BME_GIT_TAG}`. Expected vMAJOR.MINOR.PATCH.")
+    endif ()
 endif ()
 
 project(bme VERSION "${BME_PROJECT_VERSION}" LANGUAGES C CXX)
@@ -45,8 +49,8 @@ if (NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD
     message(FATAL_ERROR "${PROJECT_NAME}: Only x86-64 is supported.")
 endif ()
 
-# clang++ is primary.
-# clang-cl and MSVC use the MSVC ABI path.
+# `clang++` is primary.
+# `clang-cl` and MSVC use the MSVC ABI path.
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
         set(BME_IS_CLANG ON)
@@ -90,13 +94,6 @@ if (BME_OS_WINDOWS)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif ()
 
-# Configure local clones to use the tracked formatting hook.
-if (GIT_EXECUTABLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
-    execute_process(
-        COMMAND "${GIT_EXECUTABLE}" config core.hooksPath .githooks
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        OUTPUT_QUIET ERROR_QUIET)
-endif ()
 
 # Load third-party and project CMake modules.
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cmake" "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -237,7 +234,7 @@ function(bme_apply_warnings target)
 endfunction()
 
 # Shared core lets tests reuse BME logic.
-# CMake forwards its static dependencies to bme.
+# CMake forwards its static dependencies to `bme`.
 add_library(bme_core STATIC src/bme_core.cpp src/os.cpp ${BME_PLATFORM_SOURCE})
 bme_apply_common_config(bme_core)
 bme_apply_warnings(bme_core)
@@ -266,7 +263,7 @@ if (BME_OS_LINUX)
     set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
     set(CPACK_PACKAGE_FILE_NAME "${PROJECT_NAME}-${PROJECT_VERSION}-linux-x86_64")
     set(CPACK_GENERATOR "DEB;TGZ")
-    set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+    set(CPACK_DEBIAN_FILE_NAME "${CPACK_PACKAGE_FILE_NAME}.deb")
     set(CPACK_DEBIAN_PACKAGE_MAINTAINER "${CPACK_PACKAGE_CONTACT}")
     set(CPACK_DEBIAN_PACKAGE_SECTION "utils")
     set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)

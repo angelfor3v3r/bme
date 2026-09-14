@@ -1,8 +1,10 @@
+#include "os.hpp"
 #include "test_helpers.hpp"
 
 #include <algorithm>
 #include <array>
 #include <barrier>
+#include <cmath>
 #include <cstdint>
 #include <thread>
 
@@ -136,6 +138,8 @@ TEST(RunEngineFpu, PreservesSeededSseAndX87State)
     EXPECT_EQ(trace.steps[0].registers.xmm[0], seed.xmm[0]);
     EXPECT_EQ(trace.steps[0].registers.st[0], seed.st[0]);
     EXPECT_NE(trace.steps[0].registers.fpu_tag_word_abridged & 1, 0);
+    EXPECT_EQ(trace.steps[0].registers.fpu_control_word, DEFAULT_FPU_CONTROL_WORD);
+    EXPECT_EQ(trace.steps[0].registers.mxcsr, DEFAULT_MXCSR);
 }
 
 TEST(RunEngineFpu, DecimalStSeedSurvivesFirstStep)
@@ -157,6 +161,36 @@ TEST(RunEngineFpu, DecimalStSeedSurvivesFirstStep)
     ASSERT_EQ(trace.steps.size(), 1u);
     EXPECT_EQ(trace.steps[0].registers.st[0], expected);
     EXPECT_NE(trace.steps[0].registers.fpu_tag_word_abridged & 1, 0);
+}
+
+TEST(RunEngineFpu, CapturesLogicalX87StackAfterTopChanges)
+{
+    std::array<std::uint8_t, 2> code{0xD9, 0xE8};
+    Registers                   seed{};
+    auto                        expected = compose_st_seed("1.0");
+    ASSERT_TRUE(expected.has_value());
+
+    auto trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
+    ASSERT_EQ(trace.outcome, Outcome::Finished);
+    ASSERT_EQ(trace.steps.size(), 1u);
+
+    auto &registers = trace.steps[0].registers;
+    auto  top       = (registers.fpu_status_word >> 11) & 7;
+    auto  physical  = top;
+    EXPECT_EQ(registers.st[0], *expected);
+    EXPECT_EQ(top, 7);
+    EXPECT_NE(registers.fpu_tag_word_abridged >> physical & 1, 0);
+}
+
+TEST(FpuConversion, UsesCapturedRoundingMode)
+{
+    std::array<std::uint8_t, 10> value{};
+    double_to_st80(1.0 + std::ldexp(1.0, -24), value);
+
+    auto nearest = st80_to_float(value, 0x003F);
+    auto upward  = st80_to_float(value, 0x083F);
+    EXPECT_EQ(nearest, 1.0f);
+    EXPECT_EQ(upward, std::nextafter(1.0f, 2.0f));
 }
 
 TEST(RunEngineSeed, ScratchPointersCanBeDisabled)

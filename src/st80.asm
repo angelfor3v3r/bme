@@ -6,7 +6,7 @@ PUBLIC st80_to_double
 PUBLIC double_to_st80
 PUBLIC st80_to_float
 
-; double st80_to_double(const uint8_t *bytes, uint16_t fpu_control_word)
+; `double st80_to_double(const uint8_t *bytes, uint16_t fpu_control_word)`
 ; Rounds an 80-bit x87 value to double using the supplied rounding mode.
 st80_to_double PROC
     fnstcw  word ptr[rsp + 8]
@@ -23,7 +23,7 @@ st80_to_double PROC
     ret
 st80_to_double ENDP
 
-; void double_to_st80(double value, uint8_t *out)
+; `void double_to_st80(double value, uint8_t *out)`
 ; Converts a double to an 80-bit x87 value on the FPU.
 double_to_st80 PROC
     movsd   qword ptr[rsp + 8], xmm0
@@ -32,7 +32,7 @@ double_to_st80 PROC
     ret
 double_to_st80 ENDP
 
-; float st80_to_float(const uint8_t *bytes, uint16_t fpu_control_word)
+; `float st80_to_float(const uint8_t *bytes, uint16_t fpu_control_word)`
 ; Rounds an 80-bit x87 value directly to float using the supplied rounding mode.
 st80_to_float PROC
     fnstcw  word ptr[rsp + 8]

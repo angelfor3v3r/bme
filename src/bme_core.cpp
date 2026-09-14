@@ -1,5 +1,5 @@
 // Version metadata.
-// CMake generates bme_version.hpp each build, falling back to placeholders outside CMake.
+// CMake generates `bme_version.hpp` each build, falling back to placeholders outside CMake.
 #if __has_include("bme_version.hpp")
 #include "bme_version.hpp"
 #else
@@ -60,11 +60,8 @@ template <class E>
 using Error = std::unexpected<E>;
 
 // Shown by `--version` and the TUI About box.
-// Keep the copyright in sync with LICENSE.
+// Keep the copyright in sync with `LICENSE`.
 constexpr std::string_view BME_COPYRIGHT = "Copyright (c) 2026 angelfor3v3r (Dexxi) - MIT License";
-
-// Warning shown when an emulator is present.
-constexpr std::string_view EMULATOR_WARNING = "Running under an emulator or instrumentation layer. Native single-step tracing is unavailable.";
 
 constexpr std::array<std::string_view, REG_COUNT> REG_NAMES{{
     "RAX",
@@ -87,7 +84,7 @@ constexpr std::array<std::string_view, REG_COUNT> REG_NAMES{{
     "RFLAGS",
 }};
 
-// Sub-register names for the GPR drill-down, indexed like REG_NAMES[0..15] (RAX -> EAX -> AX -> AH/AL).
+// Sub-register names for the GPR drill-down, indexed like `REG_NAMES[0..15]` (`RAX` -> `EAX` -> `AX` -> `AH`/`AL`).
 constexpr std::array<std::string_view, GPR_COUNT> GPR_NAMES_32{{
     "EAX",
     "EBX",
@@ -145,12 +142,12 @@ constexpr std::array<std::string_view, GPR_COUNT> GPR_NAMES_8L{{
     "R15B",
 }};
 
-// The high-byte alias (AH/BH/CH/DH) only exists for the legacy A/B/C/D registers.
+// The high-byte aliases (`AH`/`BH`/`CH`/`DH`) only exist for the legacy `A`/`B`/`C`/`D` registers.
 constexpr std::array<std::string_view, 4> GPR_NAMES_8H{{"AH", "BH", "CH", "DH"}};
 
 // Register-panel display order.
-// RIP first (the current instruction), then the GPRs in canonical order, then RFLAGS. RIP, RSP, and RFLAGS are engine-controlled and shown flat (no
-// seed, no drill-down). The rest are seedable with sub-register drill-down.
+// `RIP` first (the current instruction), then the GPRs in canonical order, then `RFLAGS`. `RIP`, `RSP`, and `RFLAGS` are engine-controlled and shown
+// flat (no seed, no drill-down). The rest are seedable with sub-register drill-down.
 constexpr std::array<Reg, REG_COUNT> REGISTER_DISPLAY_ORDER{{
     Reg::RIP,
     Reg::RAX,
@@ -172,7 +169,7 @@ constexpr std::array<Reg, REG_COUNT> REGISTER_DISPLAY_ORDER{{
     Reg::RFLAGS,
 }};
 
-// The seven user-visible, seedable RFLAGS flags (status flags + DF), high-to-low bit order (the conventional debugger layout).
+// The seven user-visible, seedable `RFLAGS` flags (status flags plus `DF`), high-to-low bit order (the conventional debugger layout).
 // Shared by the Flags panel and `--quick`.
 struct StatusFlag
 {
@@ -181,13 +178,13 @@ struct StatusFlag
 };
 
 constexpr std::array<StatusFlag, 7> STATUS_FLAGS{{
-    {"OF", OF},
-    {"DF", DF},
-    {"SF", SF},
-    {"ZF", ZF},
-    {"AF", AF},
-    {"PF", PF},
-    {"CF", CF},
+    {.name = "OF", .bit = OF},
+    {.name = "DF", .bit = DF},
+    {.name = "SF", .bit = SF},
+    {.name = "ZF", .bit = ZF},
+    {.name = "AF", .bit = AF},
+    {.name = "PF", .bit = PF},
+    {.name = "CF", .bit = CF},
 }};
 
 struct BackendInfo
@@ -272,7 +269,7 @@ auto format_float(T value)
 auto format_float_single(float value) { return format_float(value) + "f"; }
 
 // Classify an x87 register for display.
-// `valid` is the FXSAVE abridged tag bit. When set, the 80-bit value is inspected for Zero/Special/Nonzero.
+// `valid` is the `FXSAVE` abridged tag bit. When set, the 80-bit value is inspected for `Zero`/`Special`/`Nonzero`.
 std::string_view x87_tag_name(bool valid, const std::array<std::uint8_t, 10> &bytes) noexcept
 {
     if (!valid)
@@ -356,7 +353,7 @@ std::vector<std::string> decode_mxcsr(std::uint32_t mxcsr)
         {{"IE", 0x01}, {"DE", 0x02}, {"ZE", 0x04}, {"OE", 0x08}, {"UE", 0x10}, {"PE", 0x20}}
     };
 
-    // DAZ (denormals-are-zero) and FZ (flush-to-zero) are mode controls, not exception flags.
+    // `DAZ` (denormals-are-zero) and `FZ` (flush-to-zero) are mode controls, not exception flags.
     constexpr std::array<std::pair<std::string_view, std::uint32_t>, 2> MODES{{{"DAZ", 0x40}, {"FZ", 0x8000}}};
 
     return {
@@ -368,7 +365,7 @@ std::vector<std::string> decode_mxcsr(std::uint32_t mxcsr)
 }
 
 // Render a decoded control/status word as stacked lines.
-// `prefix` on the first, each group (Masks/Flags/CC/Modes) indented on its own line so nothing wraps off-screen.
+// `prefix` on the first, each group (`Masks`/`Flags`/`CC`/`Modes`) indented on its own line so nothing wraps off-screen.
 auto decode_block(const std::string &prefix, const std::vector<std::string> &groups)
 {
     ftxui::Elements lines{};
@@ -382,13 +379,23 @@ auto decode_block(const std::string &prefix, const std::vector<std::string> &gro
 
 Result<std::vector<std::uint8_t>, std::string> parse_hex(std::string_view text)
 {
-    std::vector<std::uint8_t> result{};
-    result.reserve(text.size() / 2);
-
+    // Check for whitespace-only input and reserve `result`.
     std::size_t i{};
+    while (i < text.size() && std::isspace((std::uint8_t)text[i]) != 0)
+    {
+        ++i;
+    }
+
+    if (i == text.size())
+    {
+        return Error{"No code to run"};
+    }
+
+    std::vector<std::uint8_t> result{};
+    result.reserve((text.size() - i) / 2);
     while (i < text.size())
     {
-        if (std::isspace((std::uint8_t)text[i]))
+        if (std::isspace((std::uint8_t)text[i]) != 0)
         {
             ++i;
 
@@ -396,7 +403,7 @@ Result<std::vector<std::uint8_t>, std::string> parse_hex(std::string_view text)
         }
 
         // A byte needs two contiguous hex digits.
-        if (i + 2 > text.size() || std::isspace((std::uint8_t)text[i + 1]))
+        if (text.size() - i < 2 || std::isspace((std::uint8_t)text[i + 1]) != 0)
         {
             return Error{fmt::format("Dangling hex nibble at position {}", i)};
         }
@@ -412,11 +419,6 @@ Result<std::vector<std::uint8_t>, std::string> parse_hex(std::string_view text)
         result.emplace_back(byte);
 
         i += 2;
-    }
-
-    if (result.empty())
-    {
-        return Error{"No code to run"};
     }
 
     return result;
@@ -523,8 +525,8 @@ bool is_decimal_seed(std::string_view text) noexcept
     return text.find('.') != std::string_view::npos || text.find_first_of("iInN") != std::string_view::npos;
 }
 
-// Composes a 128-bit XMM seed from hex (up to 32 digits, optional `0x`) or a decimal (optional f/l suffix).
-// Single lands in the low 32 bits, double in the low 64 bits. Empty text seeds zero. Returns {low, high}.
+// Composes a 128-bit XMM seed from hex (up to 32 digits, optional `0x`) or a decimal (optional `f`/`l` suffix).
+// Single lands in the low 32 bits, double in the low 64 bits. Empty text seeds zero. Returns `{low, high}`.
 Result<std::array<std::uint64_t, 2>, std::string> compose_xmm_seed(const std::string &text)
 {
     if (text.empty())
@@ -541,8 +543,8 @@ Result<std::array<std::uint64_t, 2>, std::string> compose_xmm_seed(const std::st
             return Error{parsed.error()};
         }
 
-        // Single -> low 32 bits (f32x4 lane 0).
-        // Double -> low 64 bits (f64x2 lane 0).
+        // Single -> low 32 bits (`f32x4` lane 0).
+        // Double -> low 64 bits (`f64x2` lane 0).
         // Upper bits stay zero.
         if (parsed->is_single)
         {
@@ -584,7 +586,7 @@ Result<std::array<std::uint64_t, 2>, std::string> compose_xmm_seed(const std::st
     return result;
 }
 
-// Composes an 80-bit x87 seed from hex (up to 20 digits, optional `0x`) or a decimal (optional f/l suffix, rounded to 80-bit on the FPU).
+// Composes an 80-bit x87 seed from hex (up to 20 digits, optional `0x`) or a decimal (optional `f`/`l` suffix, rounded to 80-bit on the FPU).
 Result<std::array<std::uint8_t, 10>, std::string> compose_st_seed(const std::string &text)
 {
     if (text.empty())
@@ -602,7 +604,7 @@ Result<std::array<std::uint8_t, 10>, std::string> compose_st_seed(const std::str
         }
 
         // Round the value to 80-bit extended on the FPU.
-        // The f/l suffix only chose the parse precision.
+        // The `f`/`l` suffix only chose the parse precision.
         double_to_st80(parsed->value, result);
 
         return result;
@@ -640,7 +642,7 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
     program.add_argument("--run").flag().help("Run the code immediately after loading.");
 
     // Keep `.nargs(1)` after `.default_value()` for `--syntax` and `--backend`.
-    // `default_value` otherwise resets nargs min to 0, parsing invalid values as stray positionals.
+    // `default_value` otherwise resets `nargs` min to 0, parsing invalid values as stray positionals.
     program.add_argument("--syntax")
         .default_value("intel")
         .nargs(1)
@@ -802,8 +804,8 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
             auto name       = entry.substr(0, equals);
             auto value_text = entry.substr(equals + 1);
 
-            // XMM register xmm0..xmm15.
-            // Hex or a decimal (optional f/l suffix).
+            // XMM register `xmm0..xmm15`.
+            // Hex or a decimal (optional `f`/`l` suffix).
             if (auto xmm_index = parse_xmm_index(name))
             {
                 if (auto value = compose_xmm_seed(std::string(value_text)); !value)
@@ -816,8 +818,8 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
                 continue;
             }
 
-            // ST register st0..st7.
-            // An 80-bit hex value or a decimal (optional f/l suffix).
+            // ST register `st0..st7`.
+            // An 80-bit hex value or a decimal (optional `f`/`l` suffix).
             if (auto st_index = parse_st_index(name))
             {
                 if (auto value = compose_st_seed(std::string(value_text)); !value)
@@ -830,7 +832,7 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
                 continue;
             }
 
-            // Full GPR or a sub-register slice (RAX / EAX / AX / AH / AL).
+            // Full GPR or a sub-register slice (`RAX` / `EAX` / `AX` / `AH` / `AL`).
             // Each slice writes its own `GPRSeed` field so `compose_gpr_seed` overlays them exactly like the TUI does.
             std::string *slice{};
             for (std::size_t reg{}; reg < GPR_COUNT && slice == nullptr; ++reg)
@@ -941,8 +943,7 @@ struct Decoded
 };
 
 // Disassemble one x86-64 instruction with the selected backend and syntax.
-// Only construction of the result string can fail.
-Decoded disasm_one(DisasmBackend backend, DisasmSyntax syntax, std::uint64_t address, const std::uint8_t *code, std::size_t size) noexcept
+Decoded disasm_one(DisasmBackend backend, DisasmSyntax syntax, std::uint64_t address, const std::uint8_t *code, std::size_t size)
 {
     Decoded result{};
 
@@ -1046,7 +1047,7 @@ struct HistoryStep
 };
 
 // Build one decoder's instruction boundaries from the original input bytes.
-auto decode_history_steps(const Trace &trace, DisasmBackend backend, DisasmSyntax syntax) noexcept
+auto decode_history_steps(const Trace &trace, DisasmBackend backend, DisasmSyntax syntax)
 {
     std::vector<HistoryStep> result{};
     if (trace.code.empty())
@@ -1065,7 +1066,7 @@ auto decode_history_steps(const Trace &trace, DisasmBackend backend, DisasmSynta
         }
     }
 
-    auto disasm_at = [&trace, backend, syntax, base](std::uint64_t rip) noexcept
+    auto disasm_at = [&trace, backend, syntax, base](std::uint64_t rip)
     {
         HistoryStep step{};
         step.rip = rip;
@@ -1093,7 +1094,7 @@ auto decode_history_steps(const Trace &trace, DisasmBackend backend, DisasmSynta
     std::size_t execution_position{};
     bool        fault_state_available{};
 
-    auto fill_gap = [&](std::uint64_t from, std::uint64_t to) noexcept
+    auto fill_gap = [&](std::uint64_t from, std::uint64_t to)
     {
         while (from < to)
         {
@@ -1160,7 +1161,7 @@ auto decode_history_steps(const Trace &trace, DisasmBackend backend, DisasmSynta
     return result;
 }
 
-void apply_history_steps(Trace &trace, std::vector<HistoryStep> decoded_steps) noexcept
+void apply_history_steps(Trace &trace, std::vector<HistoryStep> decoded_steps)
 {
     std::vector<Step> rebuilt{};
     rebuilt.reserve(decoded_steps.size());
@@ -1173,6 +1174,7 @@ void apply_history_steps(Trace &trace, std::vector<HistoryStep> decoded_steps) n
 
         auto bytes = std::span{trace.code}.subspan(decoded.offset, decoded.length);
         step.bytes.assign(bytes.begin(), bytes.end());
+
         step.text    = std::move(decoded.text);
         step.reached = decoded.reached;
         step.faulted = decoded.faulted;
@@ -1219,9 +1221,9 @@ Trace run_engine(
     });
 
     Trace trace{};
-    trace.seed              = result.seed;
-    trace.outcome           = result.outcome;
-    trace.emulator_detected = result.instrumentation_detected;
+    trace.seed                     = result.seed;
+    trace.outcome                  = result.outcome;
+    trace.instrumentation_detected = result.instrumentation_detected;
 
     if (!result.instrumentation_detected && !code.empty())
     {
@@ -1299,10 +1301,7 @@ Trace run_engine(
 }
 
 // Rebuild an existing trace with one decoder's own instruction boundaries.
-void redisasm(Trace &trace, DisasmBackend backend, DisasmSyntax syntax) noexcept
-{
-    apply_history_steps(trace, decode_history_steps(trace, backend, syntax));
-}
+void redisasm(Trace &trace, DisasmBackend backend, DisasmSyntax syntax) { apply_history_steps(trace, decode_history_steps(trace, backend, syntax)); }
 
 namespace
 {
@@ -1314,37 +1313,37 @@ struct UI
     DisasmBackend                  backend   = DisasmBackend::Zydis; // Active decode backend (Zydis default).
     DisasmSyntax                   syntax    = DisasmSyntax::Intel;  // Active disassembly syntax (Intel default).
     std::size_t                    max_steps = DEFAULT_MAX_STEPS;    // Single-step cap for the next run.
-    std::array<GPRSeed, GPR_COUNT> seed_gpr{};                       // Editable RAX..R15 seeds (per-slice hex).
-    std::uint64_t                  seed_flags{};                     // Seeded status flags (CF/PF/AF/ZF/SF/DF/OF). Applied on run.
-    std::array<std::string, 16>    seed_xmm{};                       // Seeded XMM0..15 as hex or decimal with optional precision. Applied on run.
-    std::array<std::string, 8>     seed_st{};                 // Seeded ST0..7 as 80-bit hex or decimal with optional precision. Applied on run.
-    bool                           seed_data_pointers = true; // Point RDI/RSI at the scratch data base when left unseeded.
+    std::array<GPRSeed, GPR_COUNT> seed_gpr{};                       // Editable `RAX..R15` seeds (per-slice hex).
+    std::uint64_t                  seed_flags{};                     // Seeded status flags (`CF/PF/AF/ZF/SF/DF/OF`). Applied on run.
+    std::array<std::string, 16>    seed_xmm{};                       // Seeded `XMM0..15` as hex or decimal with optional precision. Applied on run.
+    std::array<std::string, 8>     seed_st{};                 // Seeded `ST0..ST7` as 80-bit hex or decimal with optional precision. Applied on run.
+    bool                           seed_data_pointers = true; // Point `RDI`/`RSI` at the scratch data base when left unseeded.
 
     // Execution result and timeline navigation.
     Trace                                               trace{};
     std::int32_t                                        cursor{}; // Timeline position, bound to history menu.
     std::vector<std::string>                            history{};
     std::vector<HistoryStep>                            history_steps{};
-    std::int32_t                                        history_tab{}; // 0=Main, 1..BACKEND_COUNT=per-decoder.
+    std::int32_t                                        history_tab{}; // Main tab is 0, decoder tabs are `1..BACKEND_COUNT`.
     std::int32_t                                        previous_history_tab{};
     std::array<std::vector<std::string>, BACKEND_COUNT> history_backend{};
     std::array<std::vector<HistoryStep>, BACKEND_COUNT> history_backend_steps{};
 
     // Register panel view state.
-    std::int32_t                        register_tab{};    // 0=GPR 1=SSE 2=x87.
-    std::array<std::int32_t, GPR_COUNT> gpr_depth{};       // Sub-register tree depth per GPR (0=collapsed..3=8-bit).
-    std::array<bool, 16>                xmm_expand{};      // SSE panel per-XMM f32x4 drill-down (f64x2 always shows when a trace exists).
-    std::array<bool, 8>                 st_expand{};       // x87 panel per-ST narrowed float (Real4) drill-down.
-    std::array<std::int32_t, 3>         register_scroll{}; // Registers panel scroll offset (row), per tab (GPR/SSE/x87).
+    std::int32_t                        register_tab{};    // `0=GPR`, `1=SSE`, `2=x87`.
+    std::array<std::int32_t, GPR_COUNT> gpr_depth{};       // Sub-register tree depth per GPR (`0=collapsed..3=8-bit`).
+    std::array<bool, 16>                xmm_expand{};      // SSE panel per-XMM `f32x4` drill-down (`f64x2` always shows when a trace exists).
+    std::array<bool, 8>                 st_expand{};       // x87 panel per-ST narrowed float (`Real4`) drill-down.
+    std::array<std::int32_t, 3>         register_scroll{}; // Registers panel scroll offset (row), per tab (`GPR`/`SSE`/`x87`).
 
     // Status line and modal.
-    std::string status            = "Idle - Edit bytes, then Run.";
-    bool        emulator_detected = instrumentation_detected();
+    std::string status = "Idle - Edit bytes, then Run.";
+    bool        show_instrumentation_warning{};
     bool        show_about{};    // About modal visible.
     bool        show_settings{}; // Settings modal visible.
 };
 
-// A top-aligned scrolling viewport, on the public `ftxui::Node` API (ftxui has no top-align frame).
+// A top-aligned scrolling viewport, on the public `ftxui::Node` API (`ftxui` has no top-align frame).
 // Plain `ftxui::yframe` centers the focused row, leaving half a viewport of dead travel at each end. That suits following a cursor but not a wheel
 // offset, so this lands `offset` on the viewport's first visible row.
 class ScrollViewport final : public ftxui::Node
@@ -1387,7 +1386,7 @@ auto scroll_viewport(ftxui::Element child, std::int32_t &offset) { return std::m
 
 // Wraps the register tabs, scrolled by a per-tab offset getter (`ui.register_scroll`) driven by the wheel.
 // When a seed `Input` is genuinely focused (`has_real_focus`), `ftxui::yframe` follows its cursor so editing scrolls into view. Otherwise
-// `scroll_viewport` top-aligns to the offset. The pick is made in C++, not by a competing `ftxui::focus()` marker, which can never win ftxui's
+// `ScrollViewport` top-aligns to the offset. The pick is made in C++, not by a competing `ftxui::focus()` marker, which can never win ftxui's
 // tie-break (every `Input` marks its own cursor cell focusable and the active tab is the sole focusable child of its `Container::Tab`).
 // `focusPositionRelative` was tried instead and clobbered the cursor while typing.
 class ScrollerBase final : public ftxui::ComponentBase
@@ -1397,7 +1396,7 @@ private:
     std::function<bool()>           m_has_real_focus{};
 
 public:
-    ScrollerBase(ftxui::Component child, std::function<std::int32_t &()> offset, std::function<bool()> has_real_focus) noexcept :
+    ScrollerBase(ftxui::Component child, std::function<std::int32_t &()> offset, std::function<bool()> has_real_focus) :
         m_offset{std::move(offset)}, m_has_real_focus{std::move(has_real_focus)}
     {
         Add(std::move(child));
@@ -1423,7 +1422,7 @@ auto make_scroller(ftxui::Component child, std::function<std::int32_t &()> offse
 
 // A non-focusable no-op.
 // `TakeFocus()` on it (arrow-key `MoveSelector` skips it, but `TakeFocus` ignores `Focusable()`) steals its container's active-child slot from a real
-// seed `Input`, clearing what `ScrollerBase` reads as focus. Targeted by Escape, blank-space clicks, and each seed `on_enter`.
+// seed `Input`, clearing what `ScrollerBase` reads as focus. Targeted by `Escape`, blank-space clicks, and each seed `on_enter`.
 class FocusSink final : public ftxui::ComponentBase
 {
 public:
@@ -1437,9 +1436,9 @@ auto make_focus_sink() { return ftxui::Make<FocusSink>(); }
 } // namespace
 
 // Composes a 64-bit seed from the per-slice text.
-// The widest non-empty field is the base, each narrower non-empty field overlays its bits (EAX refines RAX, AL refines AX, and so on). Empty fields
-// are ignored. A malformed field is skipped (its bits stay whatever the wider field set, never zeroed over) and appended to `errors` as "{label}:
-// {reason}".
+// The widest non-empty field is the base, each narrower non-empty field overlays its bits (`EAX` refines `RAX`, `AL` refines `AX`, and so on). Empty
+// fields are ignored. A malformed field is skipped (its bits stay whatever the wider field set, never zeroed over) and appended to `errors` as
+// `{label}: {reason}`.
 std::uint64_t compose_gpr_seed(const GPRSeed &seed, std::string_view label, std::vector<std::string> &errors)
 {
     std::uint64_t result{};
@@ -1470,7 +1469,7 @@ std::uint64_t compose_gpr_seed(const GPRSeed &seed, std::string_view label, std:
     return result;
 }
 
-// Composes seeded Registers from the per-register seed text (GPR slices, RFLAGS, XMM, ST), shared by the TUI's Run and `--quick`.
+// Composes seeded `Registers` from the per-register seed text (`GPR` slices, `RFLAGS`, `XMM`, `ST`), shared by the TUI's Run and `--quick`.
 // A malformed field is left unseeded, never blocking the run, and reported in `errors`. Unlike `--seed`'s hard error at CLI parse time, this is
 // always lenient.
 Registers compose_seed(
@@ -1717,6 +1716,10 @@ std::int32_t run_tui(const CLI &cli)
 {
     UI ui{};
 
+    // Warn before the first run.
+    // The platform preflight checks again immediately before execution.
+    ui.show_instrumentation_warning = instrumentation_detected();
+
     if (cli.bytes)
     {
         ui.code = *cli.bytes;
@@ -1739,8 +1742,6 @@ std::int32_t run_tui(const CLI &cli)
     ui.seed_xmm   = cli.seed_xmm;
     ui.seed_st    = cli.seed_st;
 
-    auto screen = ftxui::ScreenInteractive::Fullscreen();
-
     auto run = [&ui]
     {
         auto decoded = parse_hex(ui.code);
@@ -1751,14 +1752,18 @@ std::int32_t run_tui(const CLI &cli)
             return;
         }
 
-        // Malformed seed text is lenient here (unlike --seed's hard error at CLI parse time).
+        // Malformed seed text is lenient here (unlike `--seed`'s hard error at CLI parse time).
         // The run still proceeds with that field left unseeded, and the reason is appended to the status line instead of being silently discarded.
         std::vector<std::string> seed_errors{};
         auto                     seed = compose_seed(ui.seed_gpr, ui.seed_flags, ui.seed_xmm, ui.seed_st, seed_errors);
 
-        ui.trace             = run_engine(*decoded, seed, ui.max_steps, ui.backend, ui.syntax, ui.seed_data_pointers);
-        ui.emulator_detected = ui.emulator_detected || ui.trace.emulator_detected;
-        ui.cursor            = 0;
+        ui.trace  = run_engine(*decoded, seed, ui.max_steps, ui.backend, ui.syntax, ui.seed_data_pointers);
+        ui.cursor = 0;
+
+        if (ui.trace.instrumentation_detected)
+        {
+            ui.show_instrumentation_warning = true;
+        }
 
         rebuild_history(ui);
 
@@ -1890,8 +1895,9 @@ std::int32_t run_tui(const CLI &cli)
         ftxui::Component byte_low{};
     };
 
-    // One seed `ftxui::Input` per editable GPR slice, shown with the drill-down depth (`ftxui::Maybe`-gated) and composed back into `ui.seed[i]` at
-    // run. `on_enter` drops focus like Escape, so Enter also leaves the field.
+    // One seed `ftxui::Input` per editable GPR slice, shown with the drill-down depth (`ftxui::Maybe`-gated) and composed back into `ui.seed_gpr[i]`
+    // at run.
+    // `on_enter` drops focus like Escape, so Enter also leaves the field.
     std::array<GPRSeedInputs, GPR_COUNT> seed_inputs{};
     ftxui::Components                    seed_components{};
     auto                                 gpr_focus_sink = make_focus_sink();
@@ -1899,11 +1905,11 @@ std::int32_t run_tui(const CLI &cli)
     ftxui::InputOption seed_option{};
     seed_option.multiline   = false;
     seed_option.placeholder = "0";
-    seed_option.on_enter    = [&]() noexcept { gpr_focus_sink->TakeFocus(); };
+    seed_option.on_enter    = [gpr_focus_sink]() noexcept { gpr_focus_sink->TakeFocus(); };
 
     for (std::size_t i{}; i < GPR_COUNT; ++i)
     {
-        // RSP is engine-controlled (always reset to the scratch-stack top).
+        // `RSP` is engine-controlled (always reset to the scratch-stack top).
         // No seed input.
         if (i == (std::size_t)Reg::RSP)
         {
@@ -1919,7 +1925,7 @@ std::int32_t run_tui(const CLI &cli)
         seed_components.emplace_back(ftxui::Maybe(seed_inputs[i].dword, [&ui, i]() noexcept { return ui.gpr_depth[i] >= 1; }));
         seed_components.emplace_back(ftxui::Maybe(seed_inputs[i].word, [&ui, i]() noexcept { return ui.gpr_depth[i] >= 2; }));
 
-        // The high-byte alias (AH/BH/CH/DH) only exists for the legacy A/B/C/D registers.
+        // The high-byte aliases (`AH`/`BH`/`CH`/`DH`) only exist for the legacy `A`/`B`/`C`/`D` registers.
         if (i < 4)
         {
             seed_inputs[i].byte_high = ftxui::Input(&ui.seed_gpr[i].byte_high, seed_option);
@@ -1935,14 +1941,14 @@ std::int32_t run_tui(const CLI &cli)
     auto seed_selected  = (std::int32_t)seed_components.size() - 1;
     auto seed_container = ftxui::Container::Vertical(seed_components, &seed_selected);
 
-    // SSE/x87 seed inputs, one per register, are composed on run.
+    // `SSE`/`x87` seed inputs, one per register, are composed on run.
     // Separate `InputOption`s let `on_enter` target each panel's `FocusSink`.
     auto xmm_focus_sink = make_focus_sink();
 
     ftxui::InputOption xmm_seed_option{};
     xmm_seed_option.multiline   = false;
     xmm_seed_option.placeholder = "0";
-    xmm_seed_option.on_enter    = [&]() noexcept { xmm_focus_sink->TakeFocus(); };
+    xmm_seed_option.on_enter    = [xmm_focus_sink]() noexcept { xmm_focus_sink->TakeFocus(); };
 
     std::array<ftxui::Component, 16> xmm_inputs{};
     ftxui::Components                xmm_seed_components{};
@@ -1962,7 +1968,7 @@ std::int32_t run_tui(const CLI &cli)
     ftxui::InputOption st_seed_option{};
     st_seed_option.multiline   = false;
     st_seed_option.placeholder = "0";
-    st_seed_option.on_enter    = [&]() noexcept { st_focus_sink->TakeFocus(); };
+    st_seed_option.on_enter    = [st_focus_sink]() noexcept { st_focus_sink->TakeFocus(); };
 
     std::array<ftxui::Component, 8> st_inputs{};
     ftxui::Components               st_seed_components{};
@@ -2023,6 +2029,7 @@ std::int32_t run_tui(const CLI &cli)
     auto settings_button = ftxui::Button("Settings", [&ui] noexcept { ui.show_settings = true; }, ftxui::ButtonOption::Ascii());
     auto about_button    = ftxui::Button("About", [&ui] noexcept { ui.show_about = true; }, ftxui::ButtonOption::Ascii());
 
+    auto screen      = ftxui::ScreenInteractive::Fullscreen();
     auto quit_button = ftxui::Button("Quit", screen.ExitLoopClosure(), ftxui::ButtonOption::Ascii());
     auto buttons     = ftxui::Container::Horizontal({run_button, step_button, back_button, reset_button, settings_button, about_button, quit_button});
 
@@ -2082,7 +2089,7 @@ std::int32_t run_tui(const CLI &cli)
         }
     );
 
-    // Clickable name-cell regions for the GPR sub-register tree.
+    // Clickable name-cell regions for the `GPR` sub-register tree.
     // Filled during render, hit-tested on click.
     struct GPRHit
     {
@@ -2093,7 +2100,7 @@ std::int32_t run_tui(const CLI &cli)
 
     std::vector<GPRHit> gpr_hits{};
 
-    // Clickable XMM name cells for the SSE lane drill-down.
+    // Clickable `XMM` name cells for the `SSE` lane drill-down.
     // Filled during render, hit-tested on click to toggle the lane view.
     struct XMMHit
     {
@@ -2103,7 +2110,7 @@ std::int32_t run_tui(const CLI &cli)
 
     std::vector<XMMHit> xmm_hits{};
 
-    // Clickable ST name cells for the x87 narrowed-float drill-down.
+    // Clickable `ST` name cells for the x87 narrowed-float drill-down.
     // Filled during render, hit-tested on click to toggle the row.
     struct STHit
     {
@@ -2141,18 +2148,18 @@ std::int32_t run_tui(const CLI &cli)
 
         gpr_hits.clear();
 
-        // One per seedable GPR (all but RSP, which is flat), up to 3 clickable levels each.
+        // One per seedable `GPR` (all but `RSP`, which is flat), up to 3 clickable levels each.
         // Reserve so `ftxui::reflect()` box refs stay stable.
         gpr_hits.reserve((GPR_COUNT - 1) * 3);
 
         copy_hits.clear();
 
         // Every value cell is a copy target.
-        // Up to 5 rows per GPR (full/dword/word/AH/AL) plus the 3 flat rows. `GPR_COUNT * 5` is a safe upper bound so `ftxui::reflect()` box refs
-        // stay stable.
+        // Up to 5 rows per `GPR` (`full`/`dword`/`word`/`AH`/`AL`) plus the 3 flat rows. `GPR_COUNT * 5` is a safe upper bound so `ftxui::reflect()`
+        // box refs stay stable.
         copy_hits.reserve(GPR_COUNT * 5);
 
-        auto make_value = [&](std::string_view text, bool changed) noexcept
+        auto make_value = [has_trace](std::string_view text, bool changed) noexcept
         {
             auto cell = ftxui::text(text);
 
@@ -2162,7 +2169,7 @@ std::int32_t run_tui(const CLI &cli)
         for (auto &&reg : REGISTER_DISPLAY_ORDER)
         {
             // Engine-controlled, flat registers.
-            // RIP (entry point), RSP (scratch-stack top), RFLAGS (live flags). No seed, no drill-down.
+            // `RIP` (entry point), `RSP` (scratch-stack top), `RFLAGS` (live flags). No seed, no drill-down.
             if (reg == Reg::RIP || reg == Reg::RSP || reg == Reg::RFLAGS)
             {
                 auto name = ftxui::text(std::string("  ") + std::string(REG_NAMES[(std::size_t)reg])) | ftxui::bold;
@@ -2174,7 +2181,7 @@ std::int32_t run_tui(const CLI &cli)
                 continue;
             }
 
-            // Seedable GPR with sub-register drill-down.
+            // Seedable `GPR` with sub-register drill-down.
             auto i     = (std::size_t)reg;
             auto depth = ui.gpr_depth[i];
             auto full  = current[reg];
@@ -2304,8 +2311,8 @@ std::int32_t run_tui(const CLI &cli)
         xmm_hits.clear();
         xmm_hits.reserve(current.xmm.size());
 
-        // Every value cell is a copy target, including each lane in the f64x2/f32x4 breakdown.
-        // Up to 7 per XMM register (hex + 2 f64x2 lanes + 4 f32x4 lanes) plus MXCSR, so `ftxui::reflect()` box refs stay stable.
+        // Every value cell is a copy target, including each lane in the `f64x2`/`f32x4` breakdown.
+        // Up to 7 per `XMM` register (hex plus 2 `f64x2` lanes plus 4 `f32x4` lanes) plus `MXCSR`, so `ftxui::reflect()` box refs stay stable.
         copy_hits.clear();
         copy_hits.reserve(current.xmm.size() * 7 + 1);
 
@@ -2375,7 +2382,7 @@ std::int32_t run_tui(const CLI &cli)
             }
         }
 
-        // MXCSR as a table row so its value lines up under the XMM values (same separator column).
+        // `MXCSR` as a table row so its value lines up under the `XMM` values (same separator column).
         // No seed input.
         auto mxcsr_text  = has_trace ? fmt::format("0x{:08X}", current.mxcsr) : std::string("-");
         auto mxcsr_value = ftxui::text(mxcsr_text);
@@ -2395,7 +2402,7 @@ std::int32_t run_tui(const CLI &cli)
             return table.Render();
         }
 
-        // MXCSR breakdown below the table.
+        // `MXCSR` breakdown below the table.
         // Each group (rounding, masks, flags, modes) on its own line.
         return ftxui::vbox({table.Render(), decode_block("", decode_mxcsr(current.mxcsr))});
     };
@@ -2420,14 +2427,14 @@ std::int32_t run_tui(const CLI &cli)
         st_hits.reserve(current.st.size());
 
         // Raw storage is always copyable, decimal values require an occupied x87 tag.
-        // Reserve 3 targets per ST so `ftxui::reflect()` box refs stay stable.
+        // Reserve 3 targets per `ST` so `ftxui::reflect()` box refs stay stable.
         copy_hits.clear();
         copy_hits.reserve(current.st.size() * 3);
 
         for (std::int32_t i{}; i < (std::int32_t)current.st.size(); ++i)
         {
-            // `st[i]` is already stack-relative (slot 0 = ST0).
-            // TOP only maps ST(i) to its physical x87 register and (physical-ordered) tag bit.
+            // `st[i]` is already stack-relative (slot 0 = `ST0`).
+            // `TOP` only maps `ST(i)` to its physical x87 register and (physical-ordered) tag bit.
             auto       &register_bytes    = current.st[(std::size_t)i];
             auto        physical          = (top_current + i) & 7;
             auto        previous_physical = (top_previous + i) & 7;
@@ -2472,7 +2479,7 @@ std::int32_t run_tui(const CLI &cli)
             );
 
             // Narrowed drill-down.
-            // The same value rounded directly to Real4 storage on the FPU, not double-rounded through a double. Raw is display-only because it is
+            // The same value rounded directly to `Real4` storage on the FPU, not double-rounded through a double. Raw is display-only because it is
             // not the register's 80-bit encoding. Value is a copy target, its `f`-suffixed text round-trips through the seed field.
             if (occupied && expanded)
             {
@@ -2589,7 +2596,7 @@ std::int32_t run_tui(const CLI &cli)
 
     // True when a real seed `Input` holds focus on the visible tab (its `FocusSink` is no longer the active child).
     // `ScrollerBase` reads it to pick yframe vs offset, the wheel handler to skip scrolling while typing.
-    auto register_has_real_focus = [&]() noexcept
+    auto register_has_real_focus = [&ui, gpr_focus_sink, xmm_focus_sink, st_focus_sink]() noexcept
     {
         switch (ui.register_tab)
         {
@@ -2600,8 +2607,8 @@ std::int32_t run_tui(const CLI &cli)
     };
 
     // Hands the visible tab's `FocusSink` the active-child slot, dropping any real seed `Input` focus.
-    // Shared by Escape, blank-space clicks, and each seed `on_enter`.
-    auto defocus_current_register_tab = [&]() noexcept
+    // Shared by `Escape`, blank-space clicks, and each seed `on_enter`.
+    auto defocus_current_register_tab = [&ui, gpr_focus_sink, xmm_focus_sink, st_focus_sink]() noexcept
     {
         switch (ui.register_tab)
         {
@@ -2612,13 +2619,13 @@ std::int32_t run_tui(const CLI &cli)
     };
 
     auto register_scroller = make_scroller(
-        register_tabs, [&]() noexcept -> std::int32_t & { return ui.register_scroll[(std::size_t)ui.register_tab]; }, register_has_real_focus
+        register_tabs, [&ui]() noexcept -> std::int32_t & { return ui.register_scroll[(std::size_t)ui.register_tab]; }, register_has_real_focus
     );
 
     // On tab switch, hand focus back to the scroller.
-    // Otherwise the toggle keeps it and arrow keys can't reach the new tab's seed Inputs until one is clicked.
+    // Otherwise the toggle keeps it and arrow keys can't reach the new tab's seed `Input`s until one is clicked.
     auto register_toggle_option      = ftxui::MenuOption::Toggle();
-    register_toggle_option.on_change = [&]() noexcept { register_scroller->TakeFocus(); };
+    register_toggle_option.on_change = [register_scroller]() noexcept { register_scroller->TakeFocus(); };
 
     auto register_toggle = ftxui::Menu(std::vector<std::string>{"GPR", "SSE", "x87"}, &ui.register_tab, register_toggle_option);
     auto registers_pane  = ftxui::Container::Vertical({register_toggle, register_scroller});
@@ -2628,7 +2635,7 @@ std::int32_t run_tui(const CLI &cli)
     ftxui::Box registers_box{};
     auto       registers_view = ftxui::CatchEvent(
         registers_pane,
-        [&](ftxui::Event event) noexcept
+        [&ui, &registers_box, &defocus_current_register_tab, &register_has_real_focus](ftxui::Event event) noexcept
         {
             if (!event.is_mouse() || !registers_box.Contain(event.mouse().x, event.mouse().y))
             {
@@ -2721,22 +2728,22 @@ std::int32_t run_tui(const CLI &cli)
                 ) | ftxui::reflect(history_box)
             );
             auto body = ftxui::hbox({left | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, 84), right | ftxui::flex}) | ftxui::flex;
-            auto emulator_warning =
-                ui.emulator_detected
-                    ? ftxui::text(fmt::format(" WARNING: {}", EMULATOR_WARNING)) | ftxui::color(ftxui::Color::LightCoral) | ftxui::bold
+            auto instrumentation_warning =
+                ui.show_instrumentation_warning
+                    ? ftxui::text(fmt::format(" WARNING: {}", INSTRUMENTATION_REFUSAL)) | ftxui::color(ftxui::Color::LightCoral) | ftxui::bold
                     : ftxui::emptyElement();
 
             return ftxui::vbox({
                 ftxui::window(ftxui::text(" BME - Bare metal machine code viewer "), ftxui::vbox({header, ftxui::separator(), controls})),
                 body,
-                emulator_warning,
+                instrumentation_warning,
                 ftxui::text(' ' + ui.status) | ftxui::dim,
             });
         }
     );
 
     // Layout-level events.
-    // Function-key shortcuts (F5/F8/F7) and the Data-address copy-click. All skipped while a modal is open.
+    // Function-key shortcuts (`F5`/`F8`/`F7`) and the Data-address copy-click. All skipped while a modal is open.
     layout = ftxui::CatchEvent(
         layout,
         [&](ftxui::Event event)
@@ -2771,7 +2778,7 @@ std::int32_t run_tui(const CLI &cli)
                 }
             }
 
-            // Escape drops a stuck seed `Input`'s focus (clicking one leaves it active forever, per ftxui) so the wheel can scroll again.
+            // `Escape` drops a stuck seed `Input`'s focus (clicking one leaves it active forever, per `ftxui`) so the wheel can scroll again.
             // Visible tab only, so it can't flip `ui.register_tab`.
             if (event == ftxui::Event::Escape)
             {
@@ -2854,8 +2861,8 @@ std::int32_t run_tui(const CLI &cli)
     layout |= ftxui::Modal(about_modal, &ui.show_about);
 
     // Settings modal.
-    // Disassembly syntax + decode backend (reuse the toggle buttons), single-step cap, and the RDI/RSI-to-scratch toggle. The cap parses into
-    // `ui.max_steps` live (last valid value kept), applied on the next Run.
+    // Disassembly syntax plus decode backend (reuse the toggle buttons), single-step cap, and the `RDI`/`RSI`-to-scratch toggle. The cap parses into
+    // `ui.max_steps` live (last valid value kept), applied on the next `Run`.
     auto max_steps_text = std::to_string(ui.max_steps);
 
     ftxui::InputOption max_steps_option{};
@@ -2930,8 +2937,8 @@ std::int32_t run_tui(const CLI &cli)
 }
 
 // Non-interactive `--quick` dump.
-// Runs the bytes with default seeds and prints the seed state, every instruction with the register deltas that `--track` selects, the not-reached
-// rows, and the final outcome.
+// Runs the bytes and prints the initial state, every instruction with the register deltas that `--track` selects, the not-reached rows, and the
+// final outcome.
 std::int32_t run_quick(const CLI &cli)
 {
     if (!cli.bytes)
@@ -2951,7 +2958,7 @@ std::int32_t run_quick(const CLI &cli)
 
     // Seed from `--seed`.
     // `CLI::parse` already validated every field strictly, so a composition failure here should be unreachable. If it happens anyway, fail loudly
-    // rather than silently run with a wrong seed. RDI/RSI still default to the scratch data base when left unseeded.
+    // rather than silently run with a wrong seed. `RDI`/`RSI` still default to the scratch data base when left unseeded.
     std::vector<std::string> seed_errors{};
     auto                     seed = compose_seed(cli.seed_gpr, cli.seed_flags, cli.seed_xmm, cli.seed_st, seed_errors);
     if (!seed_errors.empty())
@@ -2964,13 +2971,20 @@ std::int32_t run_quick(const CLI &cli)
         return 1;
     }
 
-    auto  trace = run_engine(*decoded, seed, cli.max_steps, cli.backend, cli.syntax, true);
+    auto trace = run_engine(*decoded, seed, cli.max_steps, cli.backend, cli.syntax, true);
+    if (trace.outcome == Outcome::Error)
+    {
+        fmt::println(stderr, "Error: {}", trace.message);
+
+        return 1;
+    }
+
     auto &track = cli.track;
 
     // Print the tracked registers that changed between `before` and `after`, one per line.
-    auto print_deltas = [&](const Registers &before, const Registers &after)
+    auto print_deltas = [&track](const Registers &before, const Registers &after)
     {
-        // Indented, fmt-padded delta line.
+        // Indented, `fmt`-padded delta line.
         // `<label> <before> -> <after><extra>`.
         auto row = [](std::string_view label, std::string_view before_text, std::string_view after_text, std::string_view extra = "")
         { fmt::println("{:6}{:<6} {} -> {}{}", "", label, before_text, after_text, extra); };
@@ -3057,11 +3071,6 @@ std::int32_t run_quick(const CLI &cli)
             }
         }
     };
-
-    if (trace.emulator_detected)
-    {
-        fmt::println("WARNING: {}", EMULATOR_WARNING);
-    }
 
     // Seed baseline.
     // Diff against a zeroed set so only the non-zero seed registers print.

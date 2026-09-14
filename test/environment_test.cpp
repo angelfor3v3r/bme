@@ -2,12 +2,11 @@
 #include "os.hpp"
 #include "test_helpers.hpp"
 
-#if BME_OS_WINDOWS
-#include <array>
-#else
+#if BME_OS_LINUX
 #include <cstdlib>
 #endif
 
+#include <array>
 #include <cstddef>
 #include <string>
 #include <string_view>
@@ -195,4 +194,26 @@ TEST(Environment, ScopeRestoresPreviousValue)
     }
 
     EXPECT_EQ(environment_string(outer.name()), "original");
+}
+
+TEST(Environment, InstrumentationRefusalIsExecutionError)
+{
+    EnvironmentVariableScope variable{"SDE_COMMAND_LINE"};
+    variable.set("test");
+
+    std::array<std::uint8_t, 1> code{0x90};
+    Registers                   seed{};
+    auto                        trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
+    EXPECT_EQ(trace.outcome, Outcome::Error);
+    EXPECT_TRUE(trace.instrumentation_detected);
+    EXPECT_TRUE(trace.steps.empty());
+    EXPECT_NE(trace.message.find("No trace was recorded"), std::string::npos);
+
+    auto cli = parse_cli({"--bytes", "90", "--quick"});
+    ASSERT_TRUE(cli.has_value());
+
+    auto capture = run_quick_capture(*cli);
+    EXPECT_EQ(capture.return_code, 1);
+    EXPECT_TRUE(capture.out.empty());
+    EXPECT_NE(capture.err.find("Error: Running under an emulator or instrumentation layer."), std::string::npos);
 }

@@ -114,7 +114,7 @@ bool wait_for_child(pid_t child, int &status) noexcept
     }
 }
 
-// WSL2 reports both int3 and completed syscalls as breakpoint-class traps.
+// WSL2 reports both `int3` and completed syscalls as breakpoint-class traps.
 // Use Zydis here rather than duplicating x86 instruction decoding.
 bool is_software_breakpoint(std::span<const std::uint8_t> code, std::uint64_t code_base, std::uint64_t instruction_address) noexcept
 {
@@ -172,7 +172,7 @@ void terminate_child(pid_t child) noexcept
 
 void initialize_fpu() noexcept
 {
-    std::uint32_t mxcsr = 0x1F80;
+    auto mxcsr = DEFAULT_MXCSR;
     asm volatile("fninit\n\t"
                  "ldmxcsr %0\n\t"
                  "pxor %%xmm0, %%xmm0\n\t"
@@ -197,7 +197,7 @@ void initialize_fpu() noexcept
                    "xmm14", "xmm15");
 }
 
-void child_main(const PlatformRunRequest &request, int ready_descriptor) noexcept
+void child_main(const PlatformRunRequest &request, int ready_descriptor, std::size_t page_size) noexcept
 {
     ChildReady ready{};
     if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) == -1)
@@ -208,7 +208,6 @@ void child_main(const PlatformRunRequest &request, int ready_descriptor) noexcep
         _exit(1);
     }
 
-    auto  page_size   = vm_page_size();
     auto  code_region = (request.code.size() + page_size - 1) & ~(page_size - 1);
     auto *buffer      = (std::uint8_t *)vm_alloc(code_region + page_size);
     auto *stack       = (std::uint8_t *)vm_alloc(SCRATCH_STACK_BYTES + page_size);
@@ -279,12 +278,9 @@ void snapshot_fpu(const user_fpregs_struct &source, Registers &target) noexcept
         std::memcpy(target.xmm[i].data(), source.xmm_space + (i * 4), target.xmm[i].size() * sizeof(target.xmm[i][0]));
     }
 
-    auto top = (source.swd >> 11) & 7;
     for (std::size_t i{}; i < target.st.size(); ++i)
     {
-        auto physical = ((std::size_t)top + i) & 7;
-
-        std::memcpy(target.st[i].data(), source.st_space + (physical * 4), target.st[i].size());
+        std::memcpy(target.st[i].data(), source.st_space + (i * 4), target.st[i].size());
     }
 
     target.mxcsr                 = source.mxcsr;
@@ -379,10 +375,12 @@ bool vm_protect(void *address, std::size_t size, VMProtection protection) noexce
 
 void vm_free(void *address, std::size_t size) noexcept
 {
-    if (address != nullptr)
+    if (address == nullptr)
     {
-        munmap(address, size);
+        return;
     }
+
+    munmap(address, size);
 }
 
 std::size_t vm_page_size() noexcept
@@ -475,11 +473,14 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     int pipe_descriptors[2]{};
     if (pipe(pipe_descriptors) != 0)
     {
-        result.outcome = Outcome::Faulted;
+        result.outcome = Outcome::Error;
         result.error   = "ptrace worker pipe failed.";
 
         return result;
     }
+
+    // Query before `fork` because `sysconf` need not be async-signal-safe.
+    auto page_size = vm_page_size();
 
     auto child = fork();
     if (child == -1)
@@ -487,7 +488,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
         close(pipe_descriptors[0]);
         close(pipe_descriptors[1]);
 
-        result.outcome = Outcome::Faulted;
+        result.outcome = Outcome::Error;
         result.error   = "ptrace worker fork failed.";
 
         return result;
@@ -496,7 +497,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     if (child == 0)
     {
         close(pipe_descriptors[0]);
-        child_main(request, pipe_descriptors[1]);
+        child_main(request, pipe_descriptors[1], page_size);
     }
 
     close(pipe_descriptors[1]);
@@ -510,7 +511,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     {
         terminate_child(child);
 
-        result.outcome = Outcome::Faulted;
+        result.outcome = Outcome::Error;
         result.error   = "ptrace worker startup failed.";
 
         return result;
@@ -521,7 +522,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     {
         terminate_child(child);
 
-        result.outcome = Outcome::Faulted;
+        result.outcome = Outcome::Error;
         result.error   = "ptrace worker wait failed.";
 
         return result;
@@ -529,7 +530,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
 
     if (ready.error != ChildError::None)
     {
-        result.outcome = Outcome::Faulted;
+        result.outcome = Outcome::Error;
         result.error   = child_error_name(ready.error);
 
         return result;
@@ -539,7 +540,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     {
         terminate_child(child);
 
-        result.outcome = Outcome::Faulted;
+        result.outcome = Outcome::Error;
         result.error   = "ptrace worker did not stop.";
 
         return result;
@@ -549,11 +550,16 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     {
         terminate_child(child);
 
-        result.outcome = Outcome::Faulted;
+        result.outcome = Outcome::Error;
         result.error   = std::move(error);
 
         return result;
     };
+
+    if (ptrace(PTRACE_SETOPTIONS, child, nullptr, PTRACE_O_EXITKILL) == -1)
+    {
+        return fail("ptrace options failed.");
+    }
 
     user_regs_struct   registers{};
     user_fpregs_struct fpu_registers{};
@@ -589,7 +595,6 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
 
     auto effective_rdi = request.seed_data_pointers && request.seed[Reg::RDI] == 0 ? ready.data_base : request.seed[Reg::RDI];
     auto effective_rsi = request.seed_data_pointers && request.seed[Reg::RSI] == 0 ? ready.data_base : request.seed[Reg::RSI];
-    auto max_steps     = std::min(request.max_steps != 0 ? request.max_steps : (std::size_t)1, MAX_STEPS_LIMIT);
 
     result.seed[Reg::RSP]    = ready.initial_rsp;
     result.seed[Reg::RDI]    = effective_rdi;
@@ -621,6 +626,8 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
         return fail("ptrace register set failed.");
     }
 
+    auto max_steps = std::min(request.max_steps != 0 ? request.max_steps : (std::size_t)1, MAX_STEPS_LIMIT);
+
     result.steps.reserve(max_steps + 1);
 
     auto previous_rip = ready.code_base;
@@ -639,7 +646,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
 
         if (!WIFSTOPPED(status))
         {
-            result.outcome      = Outcome::Faulted;
+            result.outcome      = Outcome::Error;
             result.error        = "ptrace worker exited unexpectedly.";
             result.stop_address = previous_rip;
 
@@ -683,7 +690,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
 
         bool completed_trap = single_step_trap;
 
-        // A completed syscall can use a breakpoint-class stop on WSL2.
+        // A completed `syscall` can use a breakpoint-class stop on WSL2.
         if (breakpoint_signal && snapshot.rip != previous_rip)
         {
             completed_trap = true;
