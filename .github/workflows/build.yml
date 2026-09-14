@@ -63,7 +63,9 @@ jobs:
       - name: Install Clang 22 and Ninja
         run: |
           choco upgrade llvm --version=22.1.0 -y --no-progress --allow-downgrade
-          choco install ninja -y --no-progress
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+          }
           echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
 
       - name: Ensure Python is available
@@ -127,7 +129,7 @@ jobs:
             set -eux
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
-            apt-get install -y ca-certificates curl git ninja-build python3 python3-pip dpkg-dev file build-essential lsb-release software-properties-common gnupg
+            apt-get install -y ca-certificates curl git ninja-build python3 python3-pip dpkg-dev file build-essential gnupg
             git config --global --add safe.directory /src
             curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
             fingerprint=$(gpg --show-keys --with-colons /tmp/llvm-snapshot.gpg.key | awk -F: '"'"'$1 == "fpr" { print $10; exit }'"'"')
