@@ -11,7 +11,7 @@ endif ()
 
 # Download-only.
 # XED has no `CMakeLists.txt` to pass to `add_subdirectory`, we just need the sources.
-CPMAddPackage(URI "gh:intelxed/xed#0bcb6237345c5066726dcc08b3d87928df3b5b26" DOWNLOAD_ONLY YES) # v2026.08.23
+CPMAddPackage(URI "gh:intelxed/xed#${BME_XED_REVISION}" DOWNLOAD_ONLY YES) # v2026.08.23
 CPMAddPackage(URI "gh:intelxed/mbuild#1b437e409221a2b5703b4d8896baa20d43e4ba1a" DOWNLOAD_ONLY YES) # v2026.08.23
 
 include(ExternalProject)

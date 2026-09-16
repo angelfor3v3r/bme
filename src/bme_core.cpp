@@ -1,3 +1,8 @@
+#include "bme_core.hpp"
+#include "common.hpp"
+#include "os.hpp"
+#include "util.hpp"
+
 // Version metadata.
 // CMake generates `bme_version.hpp` each build, falling back to placeholders outside CMake.
 #if __has_include("bme_version.hpp")
@@ -7,10 +12,6 @@
 #define BME_GIT_HASH "unknown"
 #define BME_GIT_URL  "https://github.com/angelfor3v3r/bme"
 #endif
-
-#include "bme_core.hpp"
-#include "os.hpp"
-#include "util.hpp"
 
 #include <argparse/argparse.hpp>
 #include <bddisasm.h>
@@ -41,6 +42,7 @@ extern "C"
 #include <expected>
 #include <functional>
 #include <initializer_list>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -62,6 +64,14 @@ using Error = std::unexpected<E>;
 // Shown by `--version` and the TUI About box.
 // Keep the copyright in sync with `LICENSE`.
 constexpr std::string_view BME_COPYRIGHT = "Copyright (c) 2026 angelfor3v3r (Dexxi) - MIT License";
+
+#if BME_OS_WINDOWS
+constexpr std::string_view BME_PLATFORM = "Windows x86_64";
+#elif BME_OS_LINUX
+constexpr std::string_view BME_PLATFORM = "Linux x86_64";
+#else
+#error "`bme` Unsupported platform"
+#endif
 
 constexpr std::array<std::string_view, REG_COUNT> REG_NAMES{{
     "RAX",
@@ -148,26 +158,10 @@ constexpr std::array<std::string_view, 4> GPR_NAMES_8H{{"AH", "BH", "CH", "DH"}}
 // Register-panel display order.
 // `RIP` first (the current instruction), then the GPRs in canonical order, then `RFLAGS`. `RIP`, `RSP`, and `RFLAGS` are engine-controlled and shown
 // flat (no seed, no drill-down). The rest are seedable with sub-register drill-down.
-constexpr std::array<Reg, REG_COUNT> REGISTER_DISPLAY_ORDER{{
-    Reg::RIP,
-    Reg::RAX,
-    Reg::RBX,
-    Reg::RCX,
-    Reg::RDX,
-    Reg::RSI,
-    Reg::RDI,
-    Reg::RBP,
-    Reg::RSP,
-    Reg::R8,
-    Reg::R9,
-    Reg::R10,
-    Reg::R11,
-    Reg::R12,
-    Reg::R13,
-    Reg::R14,
-    Reg::R15,
-    Reg::RFLAGS,
-}};
+constexpr std::array REGISTER_DISPLAY_ORDER{
+    Reg::RIP, Reg::RAX, Reg::RBX, Reg::RCX, Reg::RDX, Reg::RSI, Reg::RDI, Reg::RBP, Reg::RSP,
+    Reg::R8,  Reg::R9,  Reg::R10, Reg::R11, Reg::R12, Reg::R13, Reg::R14, Reg::R15, Reg::RFLAGS,
+};
 
 // The seven user-visible, seedable `RFLAGS` flags (status flags plus `DF`), high-to-low bit order (the conventional debugger layout).
 // Shared by the Flags panel and `--quick`.
@@ -225,7 +219,7 @@ auto backend_from_cli(std::string_view name) noexcept
 
 // True if `backend` can render `syntax`.
 // bddisasm is Intel-only, the others do both.
-auto backend_supports(DisasmBackend backend, DisasmSyntax syntax) noexcept
+bool backend_supports(DisasmBackend backend, DisasmSyntax syntax) noexcept
 {
     auto &info = backend_info(backend);
 
@@ -641,7 +635,7 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
     program.add_argument("--bytes").help("The input x86-64 bytes as hex, e.g. AABBCCDDEE.");
     program.add_argument("--run").flag().help("Run the code immediately after loading.");
 
-    // Keep `.nargs(1)` after `.default_value()` for `--syntax` and `--backend`.
+    // Keep `.nargs(1)` after `.default_value()` for `--syntax`, `--backend`, and `--format`.
     // `default_value` otherwise resets `nargs` min to 0, parsing invalid values as stray positionals.
     program.add_argument("--syntax")
         .default_value("intel")
@@ -653,6 +647,12 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
         .help(fmt::format("Max instructions to single-step before aborting (default {}, max {}).", DEFAULT_MAX_STEPS, MAX_STEPS_LIMIT));
 
     program.add_argument("--quick").flag().help("Print the trace to stdout and exit instead of opening the TUI (needs `--bytes`).");
+    program.add_argument("--format")
+        .default_value("text")
+        .nargs(1)
+        .choices("text", "json")
+        .help("Output format for `--quick`: text or json (default: text).");
+    program.add_argument("--pretty").flag().help("Pretty-print JSON output (requires `--quick --format json`).");
     program.add_argument("--track").help(
         "Register classes to show in `--quick`, comma-separated: gpr,rip,rflags,xmm,x87 (or all/none). Default: gpr,rip,rflags."
     );
@@ -674,6 +674,25 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
     catch (const std::exception &exception)
     {
         return Error{fmt::format("{}\n\t{}", exception.what(), program.usage())};
+    }
+
+    auto quick           = program.get<bool>("--quick");
+    auto format_explicit = program.is_used("--format");
+    if (format_explicit && !quick)
+    {
+        return Error{"`--format` requires `--quick`."};
+    }
+
+    auto format_is_json = program.get<std::string>("--format") == "json";
+    auto pretty_json    = program.get<bool>("--pretty");
+    if (pretty_json && (!quick || !format_is_json))
+    {
+        return Error{"`--pretty` requires `--quick --format json`."};
+    }
+
+    if (format_is_json && program.is_used("--track"))
+    {
+        return Error{"`--track` cannot be used with `--format json` because JSON always includes full register state."};
     }
 
     auto max_steps = DEFAULT_MAX_STEPS;
@@ -913,17 +932,19 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
     }
 
     return CLI{
-        .bytes      = program.present<std::string>("--bytes"),
-        .run        = program.get<bool>("--run"),
-        .quick      = program.get<bool>("--quick"),
-        .syntax     = syntax,
-        .backend    = backend,
-        .max_steps  = max_steps,
-        .track      = track,
-        .seed_gpr   = seed_gpr,
-        .seed_flags = seed_flags,
-        .seed_xmm   = seed_xmm,
-        .seed_st    = seed_st,
+        .bytes       = program.present<std::string>("--bytes"),
+        .run         = program.get<bool>("--run"),
+        .quick       = quick,
+        .format      = format_is_json ? OutputFormat::Json : OutputFormat::Text,
+        .pretty_json = pretty_json,
+        .syntax      = syntax,
+        .backend     = backend,
+        .max_steps   = max_steps,
+        .track       = track,
+        .seed_gpr    = seed_gpr,
+        .seed_flags  = seed_flags,
+        .seed_xmm    = seed_xmm,
+        .seed_st     = seed_st,
     };
 }
 
@@ -1013,12 +1034,7 @@ Decoded disasm_one(DisasmBackend backend, DisasmSyntax syntax, std::uint64_t add
     // Preserve each decoder's exact text.
     // Never normalize casing/spacing/operands (that native formatting is what we diff between backends). Only trim surrounding whitespace so the
     // panels line up.
-    auto not_space = [](char character) noexcept { return std::isspace((std::uint8_t)character) == 0; };
-
-    auto lead  = std::ranges::find_if(result.text, not_space);
-    auto trail = std::ranges::find_if(result.text | std::views::reverse, not_space).base();
-
-    result.text = lead < trail ? std::string(lead, trail) : std::string{};
+    trim(result.text);
 
     return result;
 }
@@ -1028,95 +1044,82 @@ Decoded disasm_one(DisasmBackend backend, DisasmSyntax syntax, std::uint64_t add
 // one guard page above.
 std::uint64_t scratch_reserve_base() noexcept { return SCRATCH_DATA_RESERVE_BASE & ~(g_allocation_granularity - 1); }
 
-struct HistoryStep
-{
-    // Decoded history row.
-    std::uint64_t rip{};
-    std::string   text{};
-    std::size_t   offset{};
-    std::size_t   length{};
-
-    // Execution state mapping.
-    std::size_t execution_position{};
-
-    // Row classification.
-    bool reached{};
-    bool faulted{};
-    bool shows_fault_state{};
-    bool data{};
-};
+} // namespace
 
 // Build one decoder's instruction boundaries from the original input bytes.
-auto decode_history_steps(const Trace &trace, DisasmBackend backend, DisasmSyntax syntax)
+std::vector<HistoryRow> build_history(const Trace &trace, DisasmBackend backend, DisasmSyntax syntax)
 {
-    std::vector<HistoryStep> result{};
-    if (trace.code.empty())
+    if (trace.code.empty() || trace.instrumentation_detected)
     {
-        return result;
+        return {};
     }
 
-    auto              base     = trace.seed[Reg::RIP];
-    auto              code_end = base + trace.code.size();
-    std::vector<bool> state_at(trace.code.size(), false);
-    for (auto &&step : trace.steps)
+    std::vector<HistoryRow> result{};
+    auto                    base     = trace.seed[Reg::RIP];
+    auto                    code_end = base + trace.code.size();
+    std::vector<bool>       event_at(trace.code.size(), false);
+    for (auto &&event : trace.execution_events)
     {
-        if ((step.reached || step.faulted) && step.rip >= base && step.rip < code_end)
+        if (event.rip >= base && event.rip < code_end)
         {
-            state_at[step.rip - base] = true;
+            event_at[event.rip - base] = true;
         }
     }
 
     auto disasm_at = [&trace, backend, syntax, base](std::uint64_t rip)
     {
-        HistoryStep step{};
-        step.rip = rip;
+        HistoryRow row{};
+        row.rip    = rip;
+        row.offset = rip - base;
 
-        std::size_t offset = rip - base;
-        step.offset        = offset;
-
-        auto  available = trace.code.size() - offset;
-        auto *bytes     = trace.code.data() + offset;
+        auto  available = trace.code.size() - row.offset;
+        auto *bytes     = trace.code.data() + row.offset;
         auto  decoded   = disasm_one(backend, syntax, rip, bytes, available);
         if (decoded && decoded.length <= available)
         {
-            step.text   = std::move(decoded.text);
-            step.length = decoded.length;
+            row.text   = std::move(decoded.text);
+            row.length = decoded.length;
         }
         else
         {
-            step.text   = "(bad)";
-            step.length = 1;
+            row.text   = "(bad)";
+            row.length = 1;
         }
 
-        return step;
+        return row;
     };
-
-    std::size_t execution_position{};
-    bool        fault_state_available{};
 
     auto fill_gap = [&](std::uint64_t from, std::uint64_t to)
     {
         while (from < to)
         {
-            auto entry = disasm_at(from);
-            auto next  = from + entry.length;
+            auto row      = disasm_at(from);
+            auto next     = from + row.length;
+            auto boundary = std::min(next, to);
 
-            // Do not let a static decode overlap an executed instruction or the end of the input.
-            if (next > to)
+            // Split a static decode before any later execution event that starts inside it.
+            for (auto address = from + 1; address < boundary; ++address)
             {
-                entry.text   = "(data)";
-                entry.data   = true;
-                entry.length = to - from;
+                if (event_at[address - base])
+                {
+                    boundary = address;
 
-                next = to;
+                    break;
+                }
             }
 
-            entry.execution_position = execution_position;
-            entry.shows_fault_state  = fault_state_available;
-
-            if (!state_at[from - base])
+            if (boundary != next)
             {
-                result.emplace_back(std::move(entry));
+                row.text   = "(data)";
+                row.kind   = HistoryRowKind::Data;
+                row.length = boundary - from;
+
+                next = boundary;
+            }
+
+            if (!event_at[from - base])
+            {
+                result.emplace_back(std::move(row));
             }
 
             from = next;
@@ -1124,81 +1127,34 @@ auto decode_history_steps(const Trace &trace, DisasmBackend backend, DisasmSynta
     };
 
     auto linear = base;
-    for (auto &&source : trace.steps)
+    for (std::size_t event_index{}; event_index < trace.execution_events.size(); ++event_index)
     {
+        auto &event = trace.execution_events[event_index];
+
         // Instruction-fetch faults can report an address outside the original input.
-        if ((!source.reached && !source.faulted) || source.rip < base || source.rip >= code_end)
+        if (event.rip < base || event.rip >= code_end)
         {
             continue;
         }
 
-        if (source.rip > linear)
+        if (event.rip > linear)
         {
-            fill_gap(linear, source.rip);
+            fill_gap(linear, event.rip);
         }
 
-        auto entry               = disasm_at(source.rip);
-        entry.reached            = source.reached;
-        entry.faulted            = source.faulted;
-        entry.shows_fault_state  = fault_state_available || source.faulted;
-        entry.execution_position = execution_position;
+        auto row                  = disasm_at(event.rip);
+        row.kind                  = event.kind == ExecutionEventKind::Completed ? HistoryRowKind::Reached : HistoryRowKind::Faulted;
+        row.execution_event_index = event_index;
 
-        if (entry.reached)
-        {
-            ++entry.execution_position;
-            ++execution_position;
-        }
+        linear = std::max(linear, event.rip + row.length);
 
-        linear = std::max(linear, source.rip + entry.length);
-
-        result.emplace_back(std::move(entry));
-
-        fault_state_available = fault_state_available || source.faulted;
+        result.emplace_back(std::move(row));
     }
 
     fill_gap(linear, code_end);
 
     return result;
 }
-
-void apply_history_steps(Trace &trace, std::vector<HistoryStep> decoded_steps)
-{
-    std::vector<Step> rebuilt{};
-    rebuilt.reserve(decoded_steps.size());
-
-    std::size_t source_index{};
-    for (auto &&decoded : decoded_steps)
-    {
-        Step step{};
-        step.rip = decoded.rip;
-
-        auto bytes = std::span{trace.code}.subspan(decoded.offset, decoded.length);
-        step.bytes.assign(bytes.begin(), bytes.end());
-
-        step.text    = std::move(decoded.text);
-        step.reached = decoded.reached;
-        step.faulted = decoded.faulted;
-        step.data    = decoded.data;
-
-        if (step.reached || step.faulted)
-        {
-            while (!trace.steps[source_index].reached && !trace.steps[source_index].faulted)
-            {
-                ++source_index;
-            }
-
-            step.registers = trace.steps[source_index].registers;
-
-            ++source_index;
-        }
-
-        rebuilt.emplace_back(std::move(step));
-    }
-
-    trace.steps = std::move(rebuilt);
-}
-
-} // namespace
 
 // TODO Move machine-code execution to a worker process.
 //      In-process code can mutate or terminate the host.
@@ -1210,25 +1166,28 @@ Trace run_engine(
     std::span<std::uint8_t> code, const Registers &seed, std::size_t max_steps, DisasmBackend backend, DisasmSyntax syntax, bool seed_data_pointers
 )
 {
+    Trace trace{};
+    trace.cpu_fingerprint     = host_cpu_fingerprint();
+    trace.requested_seed      = seed;
+    trace.requested_backend   = backend;
+    trace.requested_syntax    = syntax;
+    trace.effective_max_steps = std::min<std::size_t>(max_steps != 0 ? max_steps : 1, MAX_STEPS_LIMIT);
+    trace.seed_data_pointers  = seed_data_pointers;
+    trace.code.assign(code.begin(), code.end());
+
     std::lock_guard engine_lock{g_engine_mutex};
 
     auto result = run_platform_steps({
         .code                 = code,
         .seed                 = seed,
-        .max_steps            = max_steps,
+        .max_steps            = trace.effective_max_steps,
         .scratch_reserve_base = scratch_reserve_base(),
         .seed_data_pointers   = seed_data_pointers,
     });
 
-    Trace trace{};
     trace.seed                     = result.seed;
     trace.outcome                  = result.outcome;
     trace.instrumentation_detected = result.instrumentation_detected;
-
-    if (!result.instrumentation_detected && !code.empty())
-    {
-        trace.code.assign(code.begin(), code.end());
-    }
 
     if (result.instrumentation_detected)
     {
@@ -1244,21 +1203,21 @@ Trace run_engine(
         return trace;
     }
 
-    trace.steps.reserve(result.steps.size());
+    trace.execution_events.reserve(result.steps.size());
+
     for (auto &&platform_step : result.steps)
     {
-        auto &step     = trace.steps.emplace_back();
-        step.rip       = platform_step.rip;
-        step.registers = platform_step.registers;
-        step.reached   = !platform_step.faulted;
-        step.faulted   = platform_step.faulted;
+        trace.execution_events.emplace_back(
+            ExecutionEvent{
+                .rip       = platform_step.rip,
+                .registers = platform_step.registers,
+                .kind      = platform_step.faulted ? ExecutionEventKind::Faulted : ExecutionEventKind::Completed,
+            }
+        );
     }
 
-    // OS execution returns raw snapshots.
-    // Decode them here against the selected backend's instruction layout.
-    apply_history_steps(trace, decode_history_steps(trace, backend, syntax));
-
-    auto executed = std::ranges::count_if(trace.steps, [](const Step &step) { return step.reached; });
+    auto executed =
+        std::ranges::count_if(trace.execution_events, [](const ExecutionEvent &event) { return event.kind == ExecutionEventKind::Completed; });
 
     switch (trace.outcome)
     {
@@ -1282,7 +1241,7 @@ Trace run_engine(
 
     case Outcome::AbortedCap:
     {
-        trace.message     = fmt::format("Hit step cap ({} executed).", max_steps != 0 ? std::min(max_steps, MAX_STEPS_LIMIT) : (std::size_t)1);
+        trace.message     = fmt::format("Hit step cap ({} executed).", trace.effective_max_steps);
         trace.stop_reason = "Not reached - Step cap reached";
 
         break;
@@ -1290,8 +1249,11 @@ Trace run_engine(
 
     default:
     {
-        trace.message     = fmt::format("Finished - {} executed.", executed);
-        trace.stop_reason = "Not reached - Execution branched away";
+        trace.message = fmt::format("Finished - {} executed.", executed);
+
+        auto next_rip     = trace.execution_events.empty() ? trace.seed[Reg::RIP] : trace.execution_events.back().registers[Reg::RIP];
+        auto code_end     = trace.seed[Reg::RIP] + trace.code.size();
+        trace.stop_reason = next_rip == code_end ? "Reached end of input" : "Execution left input range";
 
         break;
     }
@@ -1299,9 +1261,6 @@ Trace run_engine(
 
     return trace;
 }
-
-// Rebuild an existing trace with one decoder's own instruction boundaries.
-void redisasm(Trace &trace, DisasmBackend backend, DisasmSyntax syntax) { apply_history_steps(trace, decode_history_steps(trace, backend, syntax)); }
 
 namespace
 {
@@ -1323,11 +1282,11 @@ struct UI
     Trace                                               trace{};
     std::int32_t                                        cursor{}; // Timeline position, bound to history menu.
     std::vector<std::string>                            history{};
-    std::vector<HistoryStep>                            history_steps{};
+    std::vector<HistoryRow>                             history_rows{};
     std::int32_t                                        history_tab{}; // Main tab is 0, decoder tabs are `1..BACKEND_COUNT`.
     std::int32_t                                        previous_history_tab{};
     std::array<std::vector<std::string>, BACKEND_COUNT> history_backend{};
-    std::array<std::vector<HistoryStep>, BACKEND_COUNT> history_backend_steps{};
+    std::array<std::vector<HistoryRow>, BACKEND_COUNT>  history_backend_rows{};
 
     // Register panel view state.
     std::int32_t                        register_tab{};    // `0=GPR`, `1=SSE`, `2=x87`.
@@ -1519,135 +1478,75 @@ Registers compose_seed(
     return seed;
 }
 
-const auto &history_steps_at(const UI &ui, std::int32_t tab) noexcept
+const auto &history_rows_at(const UI &ui, std::int32_t tab) noexcept
 {
-    return tab == 0 ? ui.history_steps : ui.history_backend_steps[(std::size_t)tab - 1];
-}
-
-const auto &state_after_execution(const Trace &trace, std::size_t execution_position) noexcept
-{
-    if (execution_position == 0)
-    {
-        return trace.seed;
-    }
-
-    auto *state = &trace.seed;
-
-    for (auto &&step : trace.steps)
-    {
-        if (step.reached)
-        {
-            state = &step.registers;
-
-            if (--execution_position == 0)
-            {
-                break;
-            }
-        }
-    }
-
-    return *state;
-}
-
-const auto &fault_state(const Trace &trace) noexcept
-{
-    for (auto &&step : trace.steps)
-    {
-        if (step.faulted)
-        {
-            return step.registers;
-        }
-    }
-
-    return trace.seed;
+    return tab == 0 ? ui.history_rows : ui.history_backend_rows[(std::size_t)tab - 1];
 }
 
 const auto &history_state_at(const UI &ui, std::size_t position) noexcept
 {
-    auto &steps = history_steps_at(ui, ui.history_tab);
-    position    = std::min(position, steps.size());
-    if (position == 0)
+    auto &rows = history_rows_at(ui, ui.history_tab);
+    position   = std::min(position, rows.size());
+
+    while (position > 0)
     {
-        return ui.trace.seed;
+        auto &row = rows[--position];
+        if (row.execution_event_index && *row.execution_event_index < ui.trace.execution_events.size())
+        {
+            return ui.trace.execution_events[*row.execution_event_index].registers;
+        }
     }
 
-    auto &step = steps[position - 1];
-
-    return step.shows_fault_state ? fault_state(ui.trace) : state_after_execution(ui.trace, step.execution_position);
+    return ui.trace.seed;
 }
 
 struct HistorySelection
 {
-    // Row identity.
-    std::uint64_t rip{};
-    std::size_t   execution_position{};
-
-    // Execution state.
-    bool has_step{};
-    bool reached{};
-    bool faulted{};
+    std::uint64_t              rip{};
+    std::optional<std::size_t> execution_event_index{};
+    bool                       has_row{};
 };
 
 auto history_selection(const UI &ui, std::int32_t tab) noexcept
 {
-    HistorySelection selection{};
+    HistorySelection result{};
+    auto            &rows = history_rows_at(ui, tab);
 
-    auto &steps = history_steps_at(ui, tab);
-
-    if (ui.cursor > 0 && (std::size_t)ui.cursor <= steps.size())
+    if (ui.cursor > 0 && (std::size_t)ui.cursor <= rows.size())
     {
-        auto &step                   = steps[(std::size_t)ui.cursor - 1];
-        selection.rip                = step.rip;
-        selection.execution_position = step.execution_position;
-        selection.has_step           = true;
-        selection.reached            = step.reached;
-        selection.faulted            = step.faulted;
+        auto &row                    = rows[(std::size_t)ui.cursor - 1];
+        result.rip                   = row.rip;
+        result.execution_event_index = row.execution_event_index;
+        result.has_row               = true;
     }
 
-    return selection;
+    return result;
 }
 
 void restore_history_selection(UI &ui, const HistorySelection &selection) noexcept
 {
-    if (!selection.has_step)
+    if (!selection.has_row)
     {
         ui.cursor = 0;
 
         return;
     }
 
-    auto &steps = history_steps_at(ui, ui.history_tab);
-    for (std::size_t i{}; i < steps.size(); ++i)
+    auto &rows = history_rows_at(ui, ui.history_tab);
+    for (std::size_t i{}; i < rows.size(); ++i)
     {
-        auto &step = steps[i];
+        auto &row = rows[i];
 
-        if (selection.reached)
+        if (selection.execution_event_index)
         {
-            if (step.reached && step.execution_position == selection.execution_position)
+            if (row.execution_event_index == selection.execution_event_index)
             {
                 ui.cursor = (std::int32_t)i + 1;
 
                 return;
             }
         }
-        else if (selection.faulted)
-        {
-            if (step.faulted && step.rip == selection.rip)
-            {
-                ui.cursor = (std::int32_t)i + 1;
-
-                return;
-            }
-        }
-        else if (!step.reached
-                 && !step.faulted
-                 && step.execution_position
-                 == selection.execution_position
-                 && step.rip
-                 <= selection.rip
-                 && selection.rip
-                 - step.rip
-                 < step.length)
+        else if (!row.execution_event_index && row.rip <= selection.rip && selection.rip - row.rip < row.length)
         {
             ui.cursor = (std::int32_t)i + 1;
 
@@ -1655,17 +1554,17 @@ void restore_history_selection(UI &ui, const HistorySelection &selection) noexce
         }
     }
 
-    ui.cursor = std::min(ui.cursor, (std::int32_t)steps.size());
+    ui.cursor = std::min(ui.cursor, (std::int32_t)rows.size());
 }
 
-auto build_history_lines(const Trace &trace, const std::vector<HistoryStep> &steps)
+auto build_history_lines(const Trace &trace, const std::vector<HistoryRow> &rows)
 {
     std::vector<std::string> lines{"- Initial (seed)"};
 
     std::size_t bytes_width{};
-    for (auto &&step : steps)
+    for (auto &&row : rows)
     {
-        bytes_width = std::max(bytes_width, step.length);
+        bytes_width = std::max(bytes_width, row.length);
     }
 
     if (bytes_width != 0)
@@ -1673,40 +1572,43 @@ auto build_history_lines(const Trace &trace, const std::vector<HistoryStep> &ste
         bytes_width = bytes_width * 3 - 1;
     }
 
-    for (auto &&step : steps)
+    std::size_t execution_position{};
+    for (auto &&row : rows)
     {
-        auto bytes = fmt::format("{:02X}", fmt::join(std::span{trace.code}.subspan(step.offset, step.length), " "));
-        if (step.reached)
+        auto bytes = fmt::format("{:02X}", fmt::join(std::span{trace.code}.subspan(row.offset, row.length), " "));
+        if (row.kind == HistoryRowKind::Reached)
         {
-            lines.emplace_back(fmt::format("{:>3}  {:08X}  {:<{}}  {}", step.execution_position, step.rip, bytes, bytes_width, step.text));
+            ++execution_position;
+
+            lines.emplace_back(fmt::format("{:>3}  {:08X}  {:<{}}  {}", execution_position, row.rip, bytes, bytes_width, row.text));
         }
         else
         {
-            auto marker  = step.faulted ? "!" : "-";
-            auto is_stop = step.rip == trace.stop_address && !trace.stop_reason.empty();
+            auto marker  = row.kind == HistoryRowKind::Faulted ? "!" : "-";
+            auto is_stop = row.rip == trace.stop_address && !trace.stop_reason.empty();
             auto note    = is_stop ? trace.stop_reason : std::string_view{"Not reached"};
 
-            lines.emplace_back(fmt::format("{:>3}  {:08X}  {:<{}}  {} ({})", marker, step.rip, bytes, bytes_width, step.text, note));
+            lines.emplace_back(fmt::format("{:>3}  {:08X}  {:<{}}  {} ({})", marker, row.rip, bytes, bytes_width, row.text, note));
         }
     }
 
     return lines;
 }
 
-// Rebuild every history from the original input with each decoder's own instruction boundaries.
+// Rebuild every history from the immutable execution events with each decoder's own instruction boundaries.
 void rebuild_history(UI &ui)
 {
     auto selection = history_selection(ui, ui.history_tab);
 
-    ui.history_steps = decode_history_steps(ui.trace, ui.backend, ui.syntax);
-    ui.history       = build_history_lines(ui.trace, ui.history_steps);
+    ui.history_rows = build_history(ui.trace, ui.backend, ui.syntax);
+    ui.history      = build_history_lines(ui.trace, ui.history_rows);
 
     for (std::size_t backend{}; backend < BACKEND_COUNT; ++backend)
     {
         auto syntax = backend_supports((DisasmBackend)backend, ui.syntax) ? ui.syntax : DisasmSyntax::Intel;
 
-        ui.history_backend_steps[backend] = decode_history_steps(ui.trace, (DisasmBackend)backend, syntax);
-        ui.history_backend[backend]       = build_history_lines(ui.trace, ui.history_backend_steps[backend]);
+        ui.history_backend_rows[backend] = build_history(ui.trace, (DisasmBackend)backend, syntax);
+        ui.history_backend[backend]      = build_history_lines(ui.trace, ui.history_backend_rows[backend]);
     }
 
     restore_history_selection(ui, selection);
@@ -1778,10 +1680,11 @@ std::int32_t run_tui(const CLI &cli)
     // Not-reached rows stay browsable through the history menu.
     auto step = [&ui]() noexcept
     {
-        auto &steps = history_steps_at(ui, ui.history_tab);
-        for (std::int32_t i = ui.cursor + 1; i <= (std::int32_t)steps.size(); ++i)
+        auto &rows = history_rows_at(ui, ui.history_tab);
+        for (std::int32_t i = ui.cursor + 1; i <= (std::int32_t)rows.size(); ++i)
         {
-            if (steps[(std::size_t)i - 1].reached || steps[(std::size_t)i - 1].faulted)
+            auto kind = rows[(std::size_t)i - 1].kind;
+            if (kind == HistoryRowKind::Reached || kind == HistoryRowKind::Faulted)
             {
                 ui.cursor = i;
 
@@ -1793,10 +1696,11 @@ std::int32_t run_tui(const CLI &cli)
     // Step back to the previous completed instruction or partial fault state, or the seed.
     auto back = [&ui]() noexcept
     {
-        auto &steps = history_steps_at(ui, ui.history_tab);
+        auto &rows = history_rows_at(ui, ui.history_tab);
         for (std::int32_t i = ui.cursor - 1; i >= 1; --i)
         {
-            if (steps[(std::size_t)i - 1].reached || steps[(std::size_t)i - 1].faulted)
+            auto kind = rows[(std::size_t)i - 1].kind;
+            if (kind == HistoryRowKind::Reached || kind == HistoryRowKind::Faulted)
             {
                 ui.cursor = i;
 
@@ -1811,7 +1715,7 @@ std::int32_t run_tui(const CLI &cli)
     {
         ui.trace                = {};
         ui.history              = {"- (No trace - Press Run)"};
-        ui.history_steps        = {};
+        ui.history_rows         = {};
         ui.previous_history_tab = 0;
 
         for (auto &&backend_history : ui.history_backend)
@@ -1819,15 +1723,15 @@ std::int32_t run_tui(const CLI &cli)
             backend_history = {"- (No trace - Press Run)"};
         }
 
-        ui.history_backend_steps = {};
-        ui.cursor                = 0;
-        ui.history_tab           = 0;
-        ui.register_tab          = 0;
-        ui.gpr_depth             = {};
-        ui.xmm_expand            = {};
-        ui.st_expand             = {};
-        ui.register_scroll       = {};
-        ui.status                = "Idle - Edit bytes, then Run.";
+        ui.history_backend_rows = {};
+        ui.cursor               = 0;
+        ui.history_tab          = 0;
+        ui.register_tab         = 0;
+        ui.gpr_depth            = {};
+        ui.xmm_expand           = {};
+        ui.st_expand            = {};
+        ui.register_scroll      = {};
+        ui.status               = "Idle - Edit bytes, then Run.";
     };
 
     std::string syntax_label  = ui.syntax == DisasmSyntax::ATT ? "Syntax: AT&T" : "Syntax: Intel";
@@ -1847,16 +1751,14 @@ std::int32_t run_tui(const CLI &cli)
 
         syntax_label = ui.syntax == DisasmSyntax::ATT ? "Syntax: AT&T" : "Syntax: Intel";
 
-        if (!ui.trace.steps.empty())
+        if (!ui.history_rows.empty())
         {
-            redisasm(ui.trace, ui.backend, ui.syntax);
             rebuild_history(ui);
         }
     };
 
-    // Cycle the decode backend.
-    // `direction` +1 forward / -1 back. If the new one can't render the active syntax (bddisasm is Intel-only), fall back to Intel. Re-disassembles
-    // the current trace in place.
+    // `direction` uses +1 to cycle forward and -1 to cycle back.
+    // Fall back to Intel if the selected backend cannot render the active syntax.
     auto cycle_backend = [&ui, &syntax_label, &backend_label](std::int32_t direction)
     {
         auto count = (std::int32_t)BACKENDS.size();
@@ -1872,9 +1774,8 @@ std::int32_t run_tui(const CLI &cli)
             syntax_label = "Syntax: Intel";
         }
 
-        if (!ui.trace.steps.empty())
+        if (!ui.history_rows.empty())
         {
-            redisasm(ui.trace, ui.backend, ui.syntax);
             rebuild_history(ui);
         }
     };
@@ -2080,7 +1981,7 @@ std::int32_t run_tui(const CLI &cli)
 
             if (event.mouse().button == ftxui::Mouse::WheelDown)
             {
-                ui.cursor = std::min((std::int32_t)history_steps_at(ui, ui.history_tab).size(), ui.cursor + 1);
+                ui.cursor = std::min((std::int32_t)history_rows_at(ui, ui.history_tab).size(), ui.cursor + 1);
 
                 return true;
             }
@@ -2142,7 +2043,7 @@ std::int32_t run_tui(const CLI &cli)
         std::vector<ftxui::Elements> rows{ftxui::Elements{ftxui::text("Seed"), ftxui::text("Register"), ftxui::text("Value")}};
 
         auto  position  = (std::size_t)ui.cursor;
-        auto  has_trace = !ui.trace.steps.empty();
+        auto  has_trace = !ui.history_rows.empty();
         auto &current   = history_state_at(ui, position);
         auto &previous  = history_state_at(ui, position == 0 ? 0 : position - 1);
 
@@ -2256,7 +2157,7 @@ std::int32_t run_tui(const CLI &cli)
         // No trace yet.
         // Show the seeded flags so clicking gives feedback. Otherwise, show the step's real flags.
         auto            position = (std::size_t)ui.cursor;
-        auto            flags    = ui.trace.steps.empty() ? ui.seed_flags : history_state_at(ui, position)[Reg::RFLAGS];
+        auto            flags    = ui.history_rows.empty() ? ui.seed_flags : history_state_at(ui, position)[Reg::RFLAGS];
         ftxui::Elements tokens{};
         for (auto &&flag : STATUS_FLAGS)
         {
@@ -2304,7 +2205,7 @@ std::int32_t run_tui(const CLI &cli)
         std::vector<ftxui::Elements> rows{ftxui::Elements{ftxui::text("Seed"), ftxui::text("Register"), ftxui::text("Value (hi : lo)")}};
 
         auto  position  = (std::size_t)ui.cursor;
-        auto  has_trace = !ui.trace.steps.empty();
+        auto  has_trace = !ui.history_rows.empty();
         auto &current   = history_state_at(ui, position);
         auto &previous  = history_state_at(ui, position == 0 ? 0 : position - 1);
 
@@ -2417,7 +2318,7 @@ std::int32_t run_tui(const CLI &cli)
         );
 
         auto  position     = (std::size_t)ui.cursor;
-        auto  has_trace    = !ui.trace.steps.empty();
+        auto  has_trace    = !ui.history_rows.empty();
         auto &current      = history_state_at(ui, position);
         auto &previous     = history_state_at(ui, position == 0 ? 0 : position - 1);
         auto  top_current  = current.fpu_status_word >> 11 & 7;
@@ -2812,11 +2713,14 @@ std::int32_t run_tui(const CLI &cli)
         }
     );
 
+    auto host_cpu_summary = format_cpu_summary(*host_cpu_fingerprint());
+
     auto about_close = [&ui] noexcept { ui.show_about = false; };
+
     auto about_ok    = ftxui::Button("Close", about_close, ftxui::ButtonOption::Ascii());
     auto about_modal = ftxui::Renderer(
         about_ok,
-        [&about_ok]
+        [&about_ok, &host_cpu_summary]
         {
             auto field = [](std::string_view label, std::string_view value)
             {
@@ -2832,6 +2736,8 @@ std::int32_t run_tui(const CLI &cli)
                        field("Version", fmt::format("{} ({})", BME_GIT_TAG, BME_GIT_HASH)),
                        field("Repository", BME_GIT_URL),
                        ftxui::text(BME_COPYRIGHT),
+                       field("CPU", host_cpu_summary),
+                       field("Platform", BME_PLATFORM),
                        ftxui::separator(),
                        field("Decoders", "Zydis (MIT), bddisasm (Apache-2.0), Capstone (BSD-3-Clause), XED (Apache-2.0)"),
                        field("Built with", "FTXUI, fmt, argparse (All MIT)"),
@@ -2936,9 +2842,8 @@ std::int32_t run_tui(const CLI &cli)
     return 0;
 }
 
-// Non-interactive `--quick` dump.
-// Runs the bytes and prints the initial state, every instruction with the register deltas that `--track` selects, the not-reached rows, and the
-// final outcome.
+// Non-interactive `--quick` output.
+// JSON writes the full trace. Text prints the initial state, selected register deltas, not-reached rows, and final outcome.
 std::int32_t run_quick(const CLI &cli)
 {
     if (!cli.bytes)
@@ -2972,6 +2877,19 @@ std::int32_t run_quick(const CLI &cli)
     }
 
     auto trace = run_engine(*decoded, seed, cli.max_steps, cli.backend, cli.syntax, true);
+    if (cli.format == OutputFormat::Json)
+    {
+        auto result = write_trace_json(trace, std::cout, cli.pretty_json);
+        if (!result)
+        {
+            fmt::println(stderr, "Error: {}", result.error());
+
+            return 1;
+        }
+
+        return trace.outcome == Outcome::Error ? 1 : 0;
+    }
+
     if (trace.outcome == Outcome::Error)
     {
         fmt::println(stderr, "Error: {}", trace.message);
@@ -3072,36 +2990,41 @@ std::int32_t run_quick(const CLI &cli)
         }
     };
 
+    fmt::println("CPU {}", format_cpu_summary(*trace.cpu_fingerprint));
+
     // Seed baseline.
     // Diff against a zeroed set so only the non-zero seed registers print.
     fmt::println("Seed");
     print_deltas({}, trace.seed);
 
     auto *previous = &trace.seed;
-    auto  base     = trace.seed[Reg::RIP];
-    for (auto &&step : trace.steps)
+    auto  history  = build_history(trace, cli.backend, cli.syntax);
+    for (auto &&row : history)
     {
-        auto offset = step.rip - base;
-        auto bytes  = fmt::format("{:02X}", fmt::join(step.bytes, " "));
-        if (step.reached)
+        auto bytes = fmt::format("{:02X}", fmt::join(std::span{trace.code}.subspan(row.offset, row.length), " "));
+        if (row.kind == HistoryRowKind::Reached)
         {
-            fmt::println("+{:<4X} {:<24} {}", offset, bytes, step.text);
+            auto &event = trace.execution_events[*row.execution_event_index];
 
-            print_deltas(*previous, step.registers);
+            fmt::println("+{:<4X} {:<24} {}", row.offset, bytes, row.text);
 
-            previous = &step.registers;
+            print_deltas(*previous, event.registers);
+
+            previous = &event.registers;
         }
-        else if (step.faulted)
+        else if (row.kind == HistoryRowKind::Faulted)
         {
-            fmt::println("!{:<4X} {:<24} {}  ({}, partial state)", offset, bytes, step.text, trace.stop_reason);
+            auto &event = trace.execution_events[*row.execution_event_index];
 
-            print_deltas(*previous, step.registers);
+            fmt::println("!{:<4X} {:<24} {}  ({}, partial state)", row.offset, bytes, row.text, trace.stop_reason);
+
+            print_deltas(*previous, event.registers);
         }
         else
         {
-            auto note = step.rip == trace.stop_address && !trace.stop_reason.empty() ? trace.stop_reason : std::string_view{"not reached"};
+            auto note = row.rip == trace.stop_address && !trace.stop_reason.empty() ? trace.stop_reason : std::string_view{"not reached"};
 
-            fmt::println(" {:<4X} {:<24} {}  ({})", offset, bytes, step.text, note);
+            fmt::println(" {:<4X} {:<24} {}  ({})", row.offset, bytes, row.text, note);
         }
     }
 

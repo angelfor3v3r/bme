@@ -29,7 +29,7 @@ decoders can disagree on the same bytes. Executing on real silicon (and swapping
 - Scratch data buffer one guard page above a fixed reservation. The TUI shows its usable address, which RDI and RSI receive by default (toggle in Settings), or paste it into any seedable register
 - Click any register value (GPR, XMM, MXCSR, x87, or an individual float in a drill-down) to copy it to the clipboard
 - Keyboard shortcuts. **F5** run, **F8** step, **F7** back
-- Headless `--quick` dump - print the trace (per-instruction register deltas) to stdout, no TUI
+- Headless `--quick` output as a human-readable trace or versioned JSON with full machine state, CPU provenance, dependency revisions, and all decoder histories
 - Detects Intel SDE and Pin instrumentation from environment markers. Windows also checks parent processes and loaded modules. Execution is refused because instrumented single-step state cannot be trusted
 - History panel has a `Main` tab plus one tab per decoder (`zydis`, `bddisasm`, `capstone`, `xed`). Each backend applies its own instruction boundaries to the original bytes without re-running the code
 
@@ -46,7 +46,7 @@ The sandbox contains common faults and instruction-count runaways, but it is not
 bme                                      # open the TUI empty
 ```
 
-Most options pre-fill TUI state. `--run`, `--quick`, `--track`, and `--version` instead control launch or output behavior.
+Most options pre-fill TUI state. `--run`, `--quick`, `--format`, `--track`, and `--version` instead control launch or output behavior.
 
 ```sh
 bme --bytes 48FFC0                       # preload "inc rax", ready to run
@@ -62,8 +62,10 @@ bme --version                            # print build version information
 - `--syntax intel|att` - disassembly syntax (default `intel`)
 - `--backend zydis|bddisasm|capstone|xed` - x86 decoder backend (default `zydis`, bddisasm is Intel-only)
 - `--max-steps N` - instruction cap before a run aborts (default `50000`, maximum `1000000`)
-- `--quick` - dump the trace to stdout and exit instead of the TUI (needs `--bytes`)
-- `--track <classes>` - register classes whose deltas `--quick` prints (`gpr,rip,rflags,xmm,x87` / `all` / `none`, default `gpr,rip,rflags`)
+- `--quick` - write the trace to stdout and exit instead of opening the TUI (needs `--bytes`)
+- `--format text|json` - `--quick` output format (default `text`). JSON always contains full state, so `--track` cannot be combined with `--format json`
+- `--pretty` - use two-space indentation for human-readable JSON. Requires `--quick --format json`
+- `--track <classes>` - register classes whose text `--quick` deltas include (`gpr,rip,rflags,xmm,x87` / `all` / `none`, default `gpr,rip,rflags`)
 - `--seed <name=value,...>` - initial register state. GPR slices and flags use hexadecimal; zero clears a flag and any nonzero value sets it.
   `XMM0..15` and `ST0..7` accept raw hexadecimal or a decimal containing `.` or spelled `inf`/`nan`, with `f` for single precision and `l` or no
   suffix for double precision. Any GPR slice is supported except `RSP` and its slices. Narrower GPR slices overlay wider ones
@@ -73,11 +75,30 @@ bme --bytes 48FFC0 --quick                                   # dump "inc rax" tr
 bme --bytes 48FFC0 --quick --track all                       # track deltas from every register class
 bme --bytes 48F7F3 --quick --seed rax=64,rbx=9               # div rbx with seeded operands (100 / 9)
 bme --bytes D8C1 --quick --track x87 --seed st0=2.0,st1=3.0  # fadd st0, st1 -> ST0 = 5
+bme --bytes 48FFC0 --quick --format json                     # export schema-versioned JSON to stdout
+bme --bytes 48FFC0 --quick --format json --pretty            # export indented JSON for human inspection
+```
+
+### JSON trace export
+
+`--format json` writes exactly one RFC 8259 document followed by a newline. Output is compact by default. Add `--pretty` for two-space-indented, human-readable JSON. Schema version 1 records:
+
+- BME version, commit, repository, and compiled dependency versions and revisions
+- Capture OS, architecture, and a process-visible CPU fingerprint with raw CPUID records
+- The requested bytes, seed, backend, syntax, step cap, and scratch-pointer policy
+- The actual seed, every completed or faulted execution event, outcome, message, and stop location
+- Native disassembly histories for all four compiled decoder backends, including each effective syntax
+
+Register values, addresses, feature masks, XMM lanes, and x87 values use fixed-width hexadecimal strings so ordinary JSON tooling cannot lose integer precision. Unavailable values use `null`. A fault raised by the supplied bytes is a successful recorded trace and returns exit code 0. An engine or instrumentation failure still emits a complete JSON document with outcome `error`, then returns nonzero. Invalid CLI arguments or byte input emit no JSON, write a diagnostic to stderr, and return nonzero. Serialization or stdout write failures also report to stderr and may leave a partial document on stdout.
+
+```sh
+bme --bytes 48FFC0 --quick --format json > trace.json
+bme --bytes 48FFC0 --quick --format json --pretty
 ```
 
 ## Build
 
-BME supports native x86-64 Windows and Linux. Python 3 is needed to build the bundled XED backend.
+BME supports native x86-64 Windows and Linux. CMake 3.31 or newer is required. Python 3 is needed to build the bundled XED backend.
 
 ### Windows
 
@@ -90,7 +111,7 @@ cmake --build build
 
 ### Linux
 
-Use Ninja and a C++23 compiler. CI builds a Debian 12 package with Clang 22. GCC 12 or newer also works.
+Use Ninja and a C++23 compiler. CI builds a Debian 12 package with Clang 22. GCC 13 or newer also works.
 
 ```sh
 cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22
@@ -121,7 +142,7 @@ Both package formats include BME's license and the bundled third-party license t
 
 ## Tests
 
-Unit tests cover BME-owned behavior including parsing, seed composition, CLI handling, environment handling, instrumentation refusal, bounded engine execution, fault-state capture, and `--quick` errors. Decoder correctness remains outside the unit-test contract. Off by default.
+Unit tests cover BME-owned behavior including parsing, seed composition, CLI handling, CPU fingerprinting, environment handling, instrumentation refusal, bounded engine execution, fault-state capture, versioned JSON serialization, and `--quick` behavior. Decoder correctness remains outside the unit-test contract. Off by default.
 
 ```sh
 cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBME_BUILD_TESTS=ON
@@ -146,6 +167,7 @@ The distributed `bme` binary includes these open-source libraries:
 | [XED](https://github.com/intelxed/xed)                  | disassembler backend  | Apache-2.0            |
 | [FTXUI](https://github.com/ArthurSonzogni/FTXUI)        | terminal UI           | MIT                   |
 | [fmt](https://github.com/fmtlib/fmt)                    | formatting            | MIT                   |
+| [Glaze](https://github.com/stephenberry/glaze)           | JSON serialization    | MIT                   |
 | [argparse](https://github.com/p-ranav/argparse)         | CLI parsing           | MIT                   |
 
 Full license texts for the bundled libraries are in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

@@ -1,10 +1,22 @@
-cmake_minimum_required(VERSION 3.28 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.31 FATAL_ERROR)
 
 # Out-of-source builds only.
 # Keep the tree clean.
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
     message(FATAL_ERROR "bme: In-source builds are not supported. Run `cmake -B build`.")
 endif ()
+
+# Exported dependency metadata also drives the CPM source pins below.
+set(BME_GLAZE_VERSION "8.3.0")
+set(BME_GLAZE_REVISION "dce5e0f7ec572725ec369a0bc59a00eeb2270a9a")
+set(BME_ZYDIS_VERSION "5.0.0")
+set(BME_ZYDIS_REVISION "a95bb71013436547f689fc0b380f48edf663066e")
+set(BME_BDDISASM_VERSION "3.0.1")
+set(BME_BDDISASM_REVISION "ba6011004839be7098f0aaae3e084f0f646ab3ba")
+set(BME_CAPSTONE_VERSION "5.0.9")
+set(BME_CAPSTONE_REVISION "022575848782a4801fd150fdbc927effcbca0864")
+set(BME_XED_VERSION "v2026.08.23")
+set(BME_XED_REVISION "0bcb6237345c5066726dcc08b3d87928df3b5b26")
 
 # Resolve Git metadata and derive the numeric package version from an exact release tag.
 find_program(GIT_EXECUTABLE git)
@@ -14,7 +26,17 @@ set(BME_VERSION_ARGS
     "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
     "-DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
     "-DIN=${CMAKE_CURRENT_SOURCE_DIR}/cmake/bme_version.hpp.in"
-    "-DOUT=${BME_VERSION_HEADER}")
+    "-DOUT=${BME_VERSION_HEADER}"
+    "-DBME_GLAZE_VERSION=${BME_GLAZE_VERSION}"
+    "-DBME_GLAZE_REVISION=${BME_GLAZE_REVISION}"
+    "-DBME_ZYDIS_VERSION=${BME_ZYDIS_VERSION}"
+    "-DBME_ZYDIS_REVISION=${BME_ZYDIS_REVISION}"
+    "-DBME_BDDISASM_VERSION=${BME_BDDISASM_VERSION}"
+    "-DBME_BDDISASM_REVISION=${BME_BDDISASM_REVISION}"
+    "-DBME_CAPSTONE_VERSION=${BME_CAPSTONE_VERSION}"
+    "-DBME_CAPSTONE_REVISION=${BME_CAPSTONE_REVISION}"
+    "-DBME_XED_VERSION=${BME_XED_VERSION}"
+    "-DBME_XED_REVISION=${BME_XED_REVISION}")
 
 block(PROPAGATE BME_GIT_TAG BME_GIT_EXACT_TAG)
     set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -66,6 +88,10 @@ else ()
     message(FATAL_ERROR "${PROJECT_NAME}: Unsupported compiler. Only clang++, clang-cl, MSVC, and GCC are supported.")
 endif ()
 
+if (BME_IS_GCC AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
+    message(FATAL_ERROR "${PROJECT_NAME}: GCC 13 or newer is required.")
+endif ()
+
 if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     message(STATUS "${PROJECT_NAME}: Setting build type to `Release` as none was specified.")
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
@@ -94,7 +120,6 @@ if (BME_OS_WINDOWS)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif ()
 
-
 # Load third-party and project CMake modules.
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cmake" "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CPM)
@@ -105,7 +130,7 @@ if (BME_OS_WINDOWS)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif ()
 
-# Runtime, UI, and decoder dependencies.
+# Runtime, UI, serialization, and decoder dependencies.
 CPMAddPackage(URI "gh:fmtlib/fmt#1be298e1bd68957e4cd352e1f676f00e07dcfb57" # 12.2.0
     OPTIONS
     "FMT_DOC OFF"
@@ -117,22 +142,32 @@ CPMAddPackage(URI "gh:p-ranav/argparse#3eda91b2e1ce7d569f84ba295507c4cd8fd96910"
     "ARGPARSE_INSTALL OFF"
     "ARGPARSE_BUILD_TESTS OFF"
     "ARGPARSE_BUILD_SAMPLES OFF")
+
+# Keep Glaze off `bme_core`.
+# Its interface warning flags belong only on the serializer target.
+CPMAddPackage(URI "gh:stephenberry/glaze#${BME_GLAZE_REVISION}" # v8.3.0
+    OPTIONS
+    "glaze_INSTALL OFF"
+    "glaze_BUILD_EXAMPLES OFF"
+    "glaze_DISABLE_SIMD_WHEN_SUPPORTED ON"
+    "glaze_DEFAULT_OPTIMIZATION_SIZE ON")
+
 CPMAddPackage(URI "gh:ArthurSonzogni/FTXUI#f921fad208912747c17d129a8ef75ec7624b6eec" # v7.0.3
     OPTIONS
     "FTXUI_ENABLE_INSTALL OFF"
     "FTXUI_ENABLE_CCACHE OFF")
-CPMAddPackage(URI "gh:zyantific/zydis#a95bb71013436547f689fc0b380f48edf663066e" # master
+CPMAddPackage(URI "gh:zyantific/zydis#${BME_ZYDIS_REVISION}" # master
     OPTIONS
     "ZYDIS_FEATURE_ENCODER OFF"
     "ZYDIS_BUILD_EXAMPLES OFF"
     "ZYDIS_BUILD_TOOLS OFF"
     "ZYDIS_BUILD_DOXYGEN OFF"
     "ZYDIS_BUILD_TESTS OFF")
-CPMAddPackage(URI "gh:bitdefender/bddisasm#ba6011004839be7098f0aaae3e084f0f646ab3ba" # v3.0.1
+CPMAddPackage(URI "gh:bitdefender/bddisasm#${BME_BDDISASM_REVISION}" # v3.0.1
     OPTIONS
     "BDD_INCLUDE_TOOL OFF"
     "BDD_INCLUDE_ISAGENERATOR_X86 OFF")
-CPMAddPackage(URI "gh:capstone-engine/capstone#022575848782a4801fd150fdbc927effcbca0864" # 5.0.9
+CPMAddPackage(URI "gh:capstone-engine/capstone#${BME_CAPSTONE_REVISION}" # 5.0.9
     OPTIONS
     "BUILD_SHARED_LIBS OFF"
     "BUILD_STATIC_LIBS ON"
@@ -233,21 +268,31 @@ function(bme_apply_warnings target)
     endif ()
 endfunction()
 
+# Isolate Glaze headers and interface flags to the serializer translation unit.
+add_library(bme_serializer OBJECT src/trace_json.cpp)
+bme_apply_common_config(bme_serializer)
+bme_apply_warnings(bme_serializer)
+
+# Debian 12 libstdc++ lacks <format> and Glaze provides a built-in fallback.
+target_compile_definitions(bme_serializer PRIVATE GLZ_USE_STD_FORMAT_FLOAT=0)
+
+target_link_libraries(bme_serializer PRIVATE glaze::glaze)
+
 # Shared core lets tests reuse BME logic.
 # CMake forwards its static dependencies to `bme`.
-add_library(bme_core STATIC src/bme_core.cpp src/os.cpp ${BME_PLATFORM_SOURCE})
+add_library(bme_core STATIC src/bme_core.cpp src/cpu.cpp src/os.cpp ${BME_PLATFORM_SOURCE})
 bme_apply_common_config(bme_core)
 bme_apply_warnings(bme_core)
 target_link_libraries(bme_core
     PUBLIC fmt::fmt
-    PRIVATE argparse::argparse ftxui::ftxui Zydis::Zydis bddisasm::bddisasm capstone_static xed bme_asm)
+    PRIVATE argparse::argparse ftxui::ftxui Zydis::Zydis bddisasm::bddisasm capstone_static xed bme_asm bme_serializer)
 
 # Thin CLI and TUI entry point.
 add_executable(bme src/main.cpp)
 bme_apply_common_config(bme)
 bme_apply_warnings(bme)
 target_link_libraries(bme PRIVATE bme_core)
-source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES src/bme_core.cpp src/os.cpp ${BME_PLATFORM_SOURCE} src/main.cpp)
+source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES src/bme_core.cpp src/cpu.cpp src/trace_json.cpp src/os.cpp ${BME_PLATFORM_SOURCE} src/main.cpp)
 
 # Install the executable and its license material.
 # `bme_core` remains an internal test seam.
@@ -281,11 +326,13 @@ if (BME_BUILD_TESTS)
     include(GoogleTest)
     add_executable(bme_tests
         test/main.cpp
+        test/cpu_test.cpp
         test/parse_test.cpp
         test/environment_test.cpp
         test/seed_test.cpp
         test/cli_test.cpp
         test/engine_test.cpp
+        test/trace_json_test.cpp
         test/quick_test.cpp)
     bme_apply_common_config(bme_tests)
     target_link_libraries(bme_tests PRIVATE bme_core GTest::gtest)

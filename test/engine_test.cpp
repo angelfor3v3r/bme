@@ -14,7 +14,7 @@ TEST(RunEngineInput, EmptyCodeRemainsIdle)
     Registers                   seed{};
     auto                        trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
     EXPECT_EQ(trace.outcome, Outcome::Idle);
-    EXPECT_TRUE(trace.steps.empty());
+    EXPECT_TRUE(trace.execution_events.empty());
 }
 
 TEST(RunEngineFault, PreservesExceptionStateWithoutCompletingInstruction)
@@ -23,11 +23,10 @@ TEST(RunEngineFault, PreservesExceptionStateWithoutCompletingInstruction)
     Registers                   seed{};
     auto                        trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
     EXPECT_EQ(trace.outcome, Outcome::Faulted);
-    EXPECT_EQ(std::ranges::count_if(trace.steps, [](const Step &step) { return step.reached; }), 0);
+    EXPECT_EQ(std::ranges::count(trace.execution_events, ExecutionEventKind::Completed, &ExecutionEvent::kind), 0);
 
-    auto fault = std::ranges::find_if(trace.steps, [](const Step &step) { return step.faulted; });
-    ASSERT_NE(fault, trace.steps.end());
-    EXPECT_FALSE(fault->reached);
+    auto fault = std::ranges::find(trace.execution_events, ExecutionEventKind::Faulted, &ExecutionEvent::kind);
+    ASSERT_NE(fault, trace.execution_events.end());
     EXPECT_EQ(fault->rip, trace.stop_address);
     EXPECT_EQ(fault->registers.rip, trace.stop_address);
 }
@@ -38,7 +37,7 @@ TEST(RunEngineBreakpoint, StopsOnPrefixedInt3WithoutCompletingInstruction)
     Registers                   seed{};
     auto                        trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
     EXPECT_EQ(trace.outcome, Outcome::Stopped);
-    EXPECT_EQ(std::ranges::count_if(trace.steps, [](const Step &step) { return step.reached; }), 0);
+    EXPECT_EQ(std::ranges::count(trace.execution_events, ExecutionEventKind::Completed, &ExecutionEvent::kind), 0);
     EXPECT_EQ(trace.stop_address, trace.seed[Reg::RIP]);
     EXPECT_EQ(trace.stop_reason, "Stopped here - int3 breakpoint");
 }
@@ -49,7 +48,7 @@ TEST(RunEngineBreakpoint, StopsOnInterruptThreeWithoutCompletingInstruction)
     Registers                   seed{};
     auto                        trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
     EXPECT_EQ(trace.outcome, Outcome::Stopped);
-    EXPECT_EQ(std::ranges::count_if(trace.steps, [](const Step &step) { return step.reached; }), 0);
+    EXPECT_EQ(std::ranges::count(trace.execution_events, ExecutionEventKind::Completed, &ExecutionEvent::kind), 0);
     EXPECT_EQ(trace.stop_address, trace.seed[Reg::RIP]);
     EXPECT_EQ(trace.stop_reason, "Stopped here - int3 breakpoint");
 }
@@ -60,7 +59,7 @@ TEST(RunEngineBreakpoint, LockPrefixedInt3Faults)
     Registers                   seed{};
     auto                        trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
     EXPECT_EQ(trace.outcome, Outcome::Faulted);
-    EXPECT_EQ(std::ranges::count_if(trace.steps, [](const Step &step) { return step.reached; }), 0);
+    EXPECT_EQ(std::ranges::count(trace.execution_events, ExecutionEventKind::Completed, &ExecutionEvent::kind), 0);
     EXPECT_EQ(trace.stop_address, trace.seed[Reg::RIP]);
 }
 
@@ -70,48 +69,131 @@ TEST(RunEngineBoundary, IncompleteInstructionFaultsWithoutPadding)
     Registers                   seed{};
     auto                        trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
     EXPECT_EQ(trace.outcome, Outcome::Faulted);
-    EXPECT_EQ(std::ranges::count_if(trace.steps, [](const Step &step) { return step.reached; }), 0);
+    EXPECT_EQ(std::ranges::count(trace.execution_events, ExecutionEventKind::Completed, &ExecutionEvent::kind), 0);
 
-    auto fault = std::ranges::find_if(trace.steps, [](const Step &step) { return step.faulted; });
-    ASSERT_NE(fault, trace.steps.end());
-    ASSERT_EQ(fault->bytes.size(), 1u);
-    EXPECT_EQ(fault->bytes[0], code[0]);
+    auto history = build_history(trace, DisasmBackend::Zydis, DisasmSyntax::Intel);
+    ASSERT_EQ(history.size(), 1u);
+    EXPECT_EQ(history[0].kind, HistoryRowKind::Faulted);
+    EXPECT_EQ(history[0].length, 1u);
+    EXPECT_EQ(trace.code[history[0].offset], code[0]);
 }
 
-TEST(RedisasmBoundary, RetFetchFaultDoesNotCreateOutOfRangeHistory)
+TEST(BuildHistoryBoundary, RetFetchFaultRemainsRawAndDoesNotCreateOutOfRangeHistory)
 {
     Trace trace{};
     trace.code           = {0xC3};
     trace.seed[Reg::RIP] = 0x1000;
     trace.stop_address   = 0;
 
-    auto &fault   = trace.steps.emplace_back();
-    fault.rip     = trace.stop_address;
-    fault.faulted = true;
+    trace.execution_events.emplace_back(ExecutionEvent{.rip = trace.stop_address, .kind = ExecutionEventKind::Faulted});
 
-    redisasm(trace, DisasmBackend::Zydis, DisasmSyntax::Intel);
-
-    ASSERT_EQ(trace.steps.size(), 1u);
-    EXPECT_EQ(trace.steps[0].rip, trace.seed[Reg::RIP]);
-    EXPECT_FALSE(trace.steps[0].faulted);
+    auto history = build_history(trace, DisasmBackend::Zydis, DisasmSyntax::Intel);
+    ASSERT_EQ(trace.execution_events.size(), 1u);
+    EXPECT_EQ(trace.execution_events[0].kind, ExecutionEventKind::Faulted);
+    EXPECT_EQ(trace.execution_events[0].rip, trace.stop_address);
+    ASSERT_EQ(history.size(), 1u);
+    EXPECT_EQ(history[0].rip, trace.seed[Reg::RIP]);
+    EXPECT_EQ(history[0].kind, HistoryRowKind::NotReached);
+    EXPECT_FALSE(history[0].execution_event_index);
 }
 
-TEST(RedisasmBoundary, GuardJumpFaultDoesNotCreateOutOfRangeHistory)
+TEST(BuildHistoryBoundary, EndGuardFaultRemainsRawAndDoesNotCreateOutOfRangeHistory)
 {
     Trace trace{};
-    trace.code           = {0xE9, 0x00, 0x00, 0x00, 0x00};
+    trace.code           = {0x90};
     trace.seed[Reg::RIP] = 0x1000;
     trace.stop_address   = trace.seed[Reg::RIP] + trace.code.size();
 
-    auto &fault   = trace.steps.emplace_back();
-    fault.rip     = trace.stop_address;
-    fault.faulted = true;
+    trace.execution_events.emplace_back(ExecutionEvent{.rip = trace.stop_address, .kind = ExecutionEventKind::Faulted});
 
-    redisasm(trace, DisasmBackend::Zydis, DisasmSyntax::Intel);
+    auto history = build_history(trace, DisasmBackend::Zydis, DisasmSyntax::Intel);
+    ASSERT_EQ(trace.execution_events.size(), 1u);
+    EXPECT_EQ(trace.execution_events[0].kind, ExecutionEventKind::Faulted);
+    EXPECT_EQ(trace.execution_events[0].rip, trace.stop_address);
+    ASSERT_EQ(history.size(), 1u);
+    EXPECT_EQ(history[0].rip, trace.seed[Reg::RIP]);
+    EXPECT_EQ(history[0].kind, HistoryRowKind::NotReached);
+    EXPECT_FALSE(history[0].execution_event_index);
+}
 
-    ASSERT_EQ(trace.steps.size(), 1u);
-    EXPECT_EQ(trace.steps[0].rip, trace.seed[Reg::RIP]);
-    EXPECT_FALSE(trace.steps[0].faulted);
+TEST(BuildHistoryModel, PreservesRepeatedEventIdentityAcrossBackends)
+{
+    Trace trace{};
+    trace.code           = {0x90};
+    trace.seed[Reg::RIP] = 0x1000;
+    trace.seed[Reg::RCX] = 3;
+    trace.outcome        = Outcome::Faulted;
+    trace.stop_address   = trace.seed[Reg::RIP] + trace.code.size();
+
+    auto &first               = trace.execution_events.emplace_back();
+    first.rip                 = trace.seed[Reg::RIP];
+    first.registers[Reg::RAX] = 1;
+
+    auto &second               = trace.execution_events.emplace_back();
+    second.rip                 = trace.seed[Reg::RIP];
+    second.registers[Reg::RAX] = 2;
+
+    trace.execution_events.emplace_back(ExecutionEvent{.rip = trace.stop_address, .kind = ExecutionEventKind::Faulted});
+
+    auto zydis_history    = build_history(trace, DisasmBackend::Zydis, DisasmSyntax::Intel);
+    auto capstone_history = build_history(trace, DisasmBackend::Capstone, DisasmSyntax::Intel);
+    ASSERT_EQ(trace.execution_events.size(), 3u);
+    EXPECT_EQ(trace.execution_events[0].registers[Reg::RAX], 1ull);
+    EXPECT_EQ(trace.execution_events[1].registers[Reg::RAX], 2ull);
+    EXPECT_EQ(trace.execution_events[2].kind, ExecutionEventKind::Faulted);
+    EXPECT_EQ(trace.seed[Reg::RCX], 3ull);
+    EXPECT_EQ(trace.outcome, Outcome::Faulted);
+    EXPECT_EQ(trace.stop_address, trace.seed[Reg::RIP] + trace.code.size());
+    EXPECT_EQ(trace.execution_events[2].rip, trace.stop_address);
+
+    for (auto *history : {&zydis_history, &capstone_history})
+    {
+        ASSERT_EQ(history->size(), 2u);
+        EXPECT_EQ((*history)[0].kind, HistoryRowKind::Reached);
+        EXPECT_EQ((*history)[0].execution_event_index, 0u);
+        EXPECT_EQ((*history)[1].kind, HistoryRowKind::Reached);
+        EXPECT_EQ((*history)[1].execution_event_index, 1u);
+    }
+}
+
+TEST(BuildHistoryModel, DoesNotDecodeStaticRowsAcrossFutureEventStarts)
+{
+    Trace trace{};
+    trace.code           = {0xEB, 0x08, 0x48, 0xFF, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0xEB, 0xF7};
+    trace.seed[Reg::RIP] = 0x1000;
+
+    trace.execution_events.emplace_back(ExecutionEvent{.rip = 0x1000});
+    trace.execution_events.emplace_back(ExecutionEvent{.rip = 0x100A});
+    trace.execution_events.emplace_back(ExecutionEvent{.rip = 0x1003});
+
+    auto history     = build_history(trace, DisasmBackend::Zydis, DisasmSyntax::Intel);
+    auto event_start = trace.execution_events.back().rip;
+    auto overlap     = std::ranges::find_if(
+        history,
+        [event_start](const HistoryRow &row)
+        {
+            auto static_row = row.kind == HistoryRowKind::NotReached || row.kind == HistoryRowKind::Data;
+
+            return static_row && row.rip < event_start && event_start < row.rip + row.length;
+        }
+    );
+    EXPECT_EQ(overlap, history.end());
+}
+
+TEST(RunEngineRequest, RetainsExportProvenanceForIdleTrace)
+{
+    std::array<std::uint8_t, 0> code{};
+    Registers                   requested_seed{};
+    requested_seed[Reg::RAX] = 0x1234;
+
+    auto trace = run_engine(code, requested_seed, MAX_STEPS_LIMIT + 1, DisasmBackend::Capstone, DisasmSyntax::ATT, false);
+    EXPECT_EQ(trace.outcome, Outcome::Idle);
+    EXPECT_TRUE(trace.execution_events.empty());
+    EXPECT_EQ(trace.requested_seed[Reg::RAX], requested_seed[Reg::RAX]);
+    EXPECT_EQ(trace.requested_backend, DisasmBackend::Capstone);
+    EXPECT_EQ(trace.requested_syntax, DisasmSyntax::ATT);
+    EXPECT_EQ(trace.effective_max_steps, MAX_STEPS_LIMIT);
+    EXPECT_FALSE(trace.seed_data_pointers);
 }
 
 TEST(RunEngineLimits, ZeroStillAllowsOneStep)
@@ -120,8 +202,8 @@ TEST(RunEngineLimits, ZeroStillAllowsOneStep)
     Registers                   seed{};
     auto                        trace = run_engine(code, seed, 0, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
     EXPECT_EQ(trace.outcome, Outcome::AbortedCap);
-    EXPECT_EQ(std::ranges::count_if(trace.steps, [](const Step &step) { return step.reached; }), 1);
-    EXPECT_EQ(std::ranges::count_if(trace.steps, [](const Step &step) { return step.faulted; }), 0);
+    EXPECT_EQ(std::ranges::count(trace.execution_events, ExecutionEventKind::Completed, &ExecutionEvent::kind), 1);
+    EXPECT_EQ(std::ranges::count(trace.execution_events, ExecutionEventKind::Faulted, &ExecutionEvent::kind), 0);
 }
 
 TEST(RunEngineFpu, PreservesSeededSseAndX87State)
@@ -134,12 +216,12 @@ TEST(RunEngineFpu, PreservesSeededSseAndX87State)
 
     auto trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
     ASSERT_EQ(trace.outcome, Outcome::Finished);
-    ASSERT_EQ(trace.steps.size(), 1u);
-    EXPECT_EQ(trace.steps[0].registers.xmm[0], seed.xmm[0]);
-    EXPECT_EQ(trace.steps[0].registers.st[0], seed.st[0]);
-    EXPECT_NE(trace.steps[0].registers.fpu_tag_word_abridged & 1, 0);
-    EXPECT_EQ(trace.steps[0].registers.fpu_control_word, DEFAULT_FPU_CONTROL_WORD);
-    EXPECT_EQ(trace.steps[0].registers.mxcsr, DEFAULT_MXCSR);
+    ASSERT_EQ(trace.execution_events.size(), 1u);
+    EXPECT_EQ(trace.execution_events[0].registers.xmm[0], seed.xmm[0]);
+    EXPECT_EQ(trace.execution_events[0].registers.st[0], seed.st[0]);
+    EXPECT_NE(trace.execution_events[0].registers.fpu_tag_word_abridged & 1, 0);
+    EXPECT_EQ(trace.execution_events[0].registers.fpu_control_word, DEFAULT_FPU_CONTROL_WORD);
+    EXPECT_EQ(trace.execution_events[0].registers.mxcsr, DEFAULT_MXCSR);
 }
 
 TEST(RunEngineFpu, DecimalStSeedSurvivesFirstStep)
@@ -158,9 +240,9 @@ TEST(RunEngineFpu, DecimalStSeedSurvivesFirstStep)
 
     auto trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
     ASSERT_EQ(trace.outcome, Outcome::Finished);
-    ASSERT_EQ(trace.steps.size(), 1u);
-    EXPECT_EQ(trace.steps[0].registers.st[0], expected);
-    EXPECT_NE(trace.steps[0].registers.fpu_tag_word_abridged & 1, 0);
+    ASSERT_EQ(trace.execution_events.size(), 1u);
+    EXPECT_EQ(trace.execution_events[0].registers.st[0], expected);
+    EXPECT_NE(trace.execution_events[0].registers.fpu_tag_word_abridged & 1, 0);
 }
 
 TEST(RunEngineFpu, CapturesLogicalX87StackAfterTopChanges)
@@ -168,13 +250,13 @@ TEST(RunEngineFpu, CapturesLogicalX87StackAfterTopChanges)
     std::array<std::uint8_t, 2> code{0xD9, 0xE8};
     Registers                   seed{};
     auto                        expected = compose_st_seed("1.0");
-    ASSERT_TRUE(expected.has_value());
+    ASSERT_TRUE(expected);
 
     auto trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
     ASSERT_EQ(trace.outcome, Outcome::Finished);
-    ASSERT_EQ(trace.steps.size(), 1u);
+    ASSERT_EQ(trace.execution_events.size(), 1u);
 
-    auto &registers = trace.steps[0].registers;
+    auto &registers = trace.execution_events[0].registers;
     auto  top       = (registers.fpu_status_word >> 11) & 7;
     auto  physical  = top;
     EXPECT_EQ(registers.st[0], *expected);
@@ -242,10 +324,10 @@ TEST(RunEngineConcurrency, ConcurrentCallsProduceIndependentTraces)
 
     ASSERT_EQ(first.outcome, Outcome::Finished);
     ASSERT_EQ(second.outcome, Outcome::Finished);
-    ASSERT_FALSE(first.steps.empty());
-    ASSERT_FALSE(second.steps.empty());
-    EXPECT_EQ(first.steps.back().registers[Reg::RAX], first_seed[Reg::RAX] + iterations);
-    EXPECT_EQ(second.steps.back().registers[Reg::RAX], second_seed[Reg::RAX] + iterations);
-    EXPECT_EQ(first.steps.back().registers[Reg::RCX], 0ull);
-    EXPECT_EQ(second.steps.back().registers[Reg::RCX], 0ull);
+    ASSERT_FALSE(first.execution_events.empty());
+    ASSERT_FALSE(second.execution_events.empty());
+    EXPECT_EQ(first.execution_events.back().registers[Reg::RAX], first_seed[Reg::RAX] + iterations);
+    EXPECT_EQ(second.execution_events.back().registers[Reg::RAX], second_seed[Reg::RAX] + iterations);
+    EXPECT_EQ(first.execution_events.back().registers[Reg::RCX], 0ull);
+    EXPECT_EQ(second.execution_events.back().registers[Reg::RCX], 0ull);
 }

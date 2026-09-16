@@ -25,8 +25,11 @@ RFLAGS, XMM, and x87 state change one instruction at a time.
 ```
 src/common.hpp       # compile-time compiler, OS, and x86-64 gates
 src/util.hpp         # ASCII case-insensitive string comparison
-src/bme_core.hpp     # public library API (namespace bme). Types, enums, parse/compose/engine/decode prototypes
-src/bme_core.cpp     # platform-neutral library logic and TUI
+src/bme_core.hpp     # public library API (namespace bme). Types, enums, parse/compose/engine/history/JSON prototypes
+src/bme_core.cpp     # platform-neutral library logic, history rendering, CLI, and TUI
+src/cpu.hpp          # CPU fingerprint data model and injectable CPUID query contract
+src/cpu.cpp          # CPUID/XGETBV collection, decoding, process cache, and summary formatting
+src/trace_json.cpp   # isolated Glaze adapter and streaming versioned JSON writer
 src/os.hpp           # private VM, environment, clipboard, and stepping contract
 src/os.cpp           # shared platform-run preflight
 src/os.windows.cpp   # Windows VM, VEH, clipboard, environment, and stepping implementation
@@ -51,6 +54,8 @@ Build dirs matching `cmake-build*` or `build*` are local/gitignored.
 
 ## Build
 
+CMake 3.31 or newer is required.
+
 Windows uses Ninja, MASM, and **clang++ targeting MSVC**. **clang-cl** and **MSVC cl** also build through the MSVC ABI path.
 
 ```sh
@@ -58,18 +63,18 @@ cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 cmake --build build
 ```
 
-Linux uses Ninja and a C++23 compiler. Debian 12 with Clang 22 is the CI and packaging baseline. GCC 12 or newer is supported.
+Linux uses Ninja and a C++23 compiler. Debian 12 with Clang 22 is the CI and packaging baseline. GCC 13 or newer is supported.
 
 ```sh
 cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22
 cmake --build build
 ```
 
-Deps (fmt 12.2.0, argparse 3.2, FTXUI 7.0.3, Zydis `a95bb710...`, bddisasm `3.0.1`, Capstone
-`5.0.9`) are fetched by CPM. Zydis also builds its pinned Zycore support library. The `URI` form
-auto-applies `EXCLUDE_FROM_ALL`/`SYSTEM`, so third-party headers stay out of `-Werror`.
-Intel XED (`v2026.08.23` plus its mbuild) has no CMake, so CPM downloads it and an ExternalProject
-builds it via `mfile.py` (`cmake/XED.cmake`) - needs Python 3.
+Deps (fmt 12.2.0, argparse 3.2, Glaze 8.3.0, FTXUI 7.0.3, Zydis `a95bb710...`, bddisasm `3.0.1`,
+Capstone `5.0.9`) are fetched by CPM. Zydis also builds its pinned Zycore support library. The `URI`
+form auto-applies `EXCLUDE_FROM_ALL`/`SYSTEM`, so third-party headers stay out of `-Werror`. Glaze is
+private to the `bme_serializer` object target. Intel XED (`v2026.08.23` plus its mbuild) has no CMake,
+so CPM downloads it and an ExternalProject builds it via `mfile.py` (`cmake/XED.cmake`) - needs Python 3.
 All slow on first configure.
 
 CI is the authoritative formatting check. Contributors may enable the tracked pre-commit hook explicitly:
@@ -96,9 +101,9 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-- The `bme_core` split exists for this. The static lib (`namespace bme`) holds all logic, so tests link it and call parser, seed-composition, CLI, environment, instrumentation preflight, quick error-path utilities, and focused engine orchestration contracts directly. `bme_tests` links `bme_core` + `GTest::gtest` with a custom `main` (`test/main.cpp`) that calls `bme::init`. It is exempt from `-Werror` so GoogleTest macros can't fail the CI build.
-- `test/test_helpers.hpp` holds only the shared CLI argument builder and stdout/stderr capture used by utility tests.
-- Scope. Test BME behavior that we own. Engine tests cover orchestration such as fault-state classification, instrumentation refusal, and concurrent-call isolation. Do not assert decoder correctness, CPU instruction semantics, ASLR-dependent registers, or decoder-specific text.
+- The `bme_core` split exists for this. The static lib (`namespace bme`) holds all logic, so tests link it and call CPU decoding, parsers, seed composition, CLI, environment, instrumentation preflight, history construction, JSON serialization, quick utilities, and focused engine orchestration contracts directly. `bme_tests` links `bme_core` + `GTest::gtest` with a custom `main` (`test/main.cpp`) that calls `bme::init`. It is exempt from `-Werror` so GoogleTest macros can't fail the CI build.
+- `test/test_helpers.hpp` holds the shared environment-variable scope, CLI argument builder, and stdout/stderr capture used by utility tests.
+- Scope. Test BME behavior that we own. Engine tests cover orchestration such as fault-state classification, instrumentation refusal, and concurrent-call isolation. Serializer tests cover schema shape, exact machine-state encoding, provenance, nulls, decoder histories, and output failures. Do not assert decoder correctness, CPU instruction semantics, ASLR-dependent registers, or decoder-specific text.
 - Keep engine cases bounded to safe byte sequences and stable architectural outcomes.
 
 ## Code style - load-bearing, the user cares a LOT
@@ -138,12 +143,11 @@ Never run clang-format on `src/st80.asm` or `src/st80.S`.
 - `Registers` struct - `gpr[16]`, `rip`, `rflags`, `xmm[16]`, `mxcsr`, `st[8]` (80-bit),
   `fpu_control_word`, `fpu_status_word`, `fpu_tag_word_abridged`
   (FXSAVE 1-bit/reg, not the 16-bit x87 tag word). `operator[](Reg)`.
-- `Step` - rip, bytes, disasm `text`, and `registers`. `reached` marks a completed instruction,
-  `faulted` marks a faulting instruction whose registers are exception-time partial state, and neither
-  marks static disassembly that never executed. `data` identifies raw "(data)" bytes.
-- `Trace` - seed, original code, steps, `Outcome` (Idle/Error/Finished/Faulted/AbortedCap/Stopped), and status
-  `message`. `Error` identifies engine or instrumentation failure, while `Faulted` identifies a fault raised
-  by the supplied bytes. `stop_reason` labels stop, fault, or not-reached rows. `stop_address` anchors an `int3` or fault to its instruction address.
+- `CPUFingerprint` stores process-visible CPUID identity, feature masks, XSAVE/XSTATE data, address widths, hypervisor data, and raw queried leaf/subleaf records. `host_cpu_fingerprint()` caches one immutable process snapshot shared by traces. `CPUQuerySource` makes collection deterministic in tests.
+- `ExecutionEvent` stores only CPU execution state: RIP, the full register snapshot, and completed/faulted classification. It has no decoder text or instruction-length fields.
+- `Trace` separates the request (`code`, requested seed/backend/syntax, effective step cap, scratch-pointer policy), recorded execution (`seed`, raw `execution_events`), host CPU fingerprint, and outcome. `Outcome::Error` identifies engine or instrumentation failure, while `Outcome::Faulted` identifies a fault raised by supplied bytes. `stop_reason` records why execution halted and labels stop, fault, or not-reached rows where applicable. `stop_address` anchors an `int3` or fault.
+- `build_history` overlays one decoder's instruction boundaries on immutable trace code and execution events. Static rows stop before every execution-event start, even when a decoder's linear instruction would cross that later entry point. `HistoryRow` maps reached and faulted rows back through `execution_event_index` without copying register snapshots. Multiple backend histories can coexist without mutating `Trace`.
+- `write_trace_json` streams compact or two-space-indented schema version 1 JSON through the Glaze-only `bme_serializer` translation unit. The document includes producer and dependency revisions, host and CPU provenance, request state, full execution snapshots, outcome, and all four decoder histories. Integer machine state uses fixed-width hexadecimal strings. Stable unavailable values use `null`. The writer appends one newline and reports serialization or stream failures.
 - Platform execution lives behind the private `os.hpp` contract. `os.cpp` handles shared preflight,
   including copying the requested seed and refusing execution when instrumentation is detected.
   Windows uses guarded `VirtualAlloc` mappings and a VEH sandbox thread. Linux uses guarded `mmap`
@@ -156,11 +160,9 @@ Never run clang-format on `src/st80.asm` or `src/st80.S`.
 - `parse_hex` (`std::from_chars`, `Result`/`std::expected`-based), `parse_seed`.
 - Decode backends (`DisasmBackend`). `disasm_one(backend, syntax, addr, code, size)` -> `Decoded`
   (`ok`/`text`/`length`), dispatching to **Zydis** (Intel + AT&T), **bddisasm** (Intel only), **Capstone** (Intel + AT&T), or **XED** (Intel + AT&T),
-  gated by `backend_supports`, which reads the per-decoder `BACKENDS` capability table. `run_engine`/`redisasm` thread the backend through. The goal is
-  differential decoding - run the same bytes through each decoder and watch where they diverge -
-  operand / RIP-relative rendering, instruction length, or outright decode disagreement - to
-  surface decoder assumptions and bugs (e.g. whether a decoder follows RIP correctly).
-- `disasm_one` returns each decoder's exact text - whitespace-trimmed only, never normalized (that native formatting is what we diff between backends).
+  gated by `backend_supports`, which reads the per-decoder `BACKENDS` capability table. `run_engine` records decoder-neutral execution events and
+  `build_history` applies a selected decoder afterward. The goal is differential decoding - run the same bytes through each decoder and watch where
+  they diverge in operand or RIP-relative rendering, instruction length, or decode success.
 - `GPRSeed` (per-GPR seed text `full`/`dword`/`word`/`byte_high`/`byte_low`) +
   `compose_gpr_seed` - widest non-empty slice is the base, each narrower non-empty
   slice overlays its bits (EAX refines RAX, AL refines AX, ...). Empty slices ignored.
@@ -267,8 +269,8 @@ Never run clang-format on `src/st80.asm` or `src/st80.S`.
   the new tab until a seed field is clicked directly. History has its own drill-down. `history_tabs`
   (`ui.history_tab`) holds a Main menu (`ui.history`, always the active Settings backend) plus one per
   `BACKENDS` decoder. Each tab is built from `Trace::code` with that decoder's own instruction boundaries,
-  falling back to Intel syntax if the backend can't render AT&T. The lightweight `HistoryStep` model maps
-  each row back to its execution position without duplicating completed register snapshots. An in-range
+  falling back to Intel syntax if the backend can't render AT&T. The lightweight `HistoryRow` model maps
+  each row back to its execution event without duplicating completed register snapshots. An in-range
   fault row is anchored at the CPU's instruction address and exposes exception-time partial state without
   incrementing the executed count. Instruction-fetch fault addresses outside `Trace::code` are not decoded
   as history rows. Switching tabs preserves the selected state or byte address even when decoder boundaries
@@ -288,15 +290,16 @@ bme --bytes 48FFC0 --backend bddisasm    # decode with bddisasm instead of Zydis
 bme --max-steps 200000                   # raise the single-step cap
 bme --version                            # tag/hash/url, clang-format style
 bme --bytes 48FFC0 --quick               # headless trace dump to stdout (--track picks register classes)
+bme --bytes 48FFC0 --quick --format json # versioned full-state JSON trace
+bme --bytes 48FFC0 --quick --format json --pretty # indented full-state JSON trace
 bme --bytes 48F7F3 --quick --seed rax=64,rbx=9 # seed GPRs/XMM/ST/flags before the run (hex or a decimal)
 ```
 
-`--quick` runs headless via `run_quick` - same `run_engine`, but prints the seed then per-step register deltas (`--track` selects classes), the not-reached rows, and the outcome instead of opening the TUI. `--seed name=value,...` sets initial state. Values can be hex, a finite decimal containing `.`, or `inf`/`nan`, with an optional `f`/`F` single-precision suffix or `l`/`L` double-precision suffix. Names are any GPR slice (`RAX`/`EAX`/`AX`/`AH`/`AL`, not `RSP`), `XMM0..15`, `ST0..7`, or a status flag (`CF/PF/AF/ZF/SF/DF/OF`). `CLI::parse` validates and stores the raw text (`seed_gpr`/`seed_flags`/`seed_xmm`/`seed_st`), feeding both the TUI seed inputs and `--quick`, which compose it (`compose_gpr_seed`/`compose_xmm_seed`/`compose_st_seed`) so narrower GPR slices overlay wider ones.
+`--quick` runs headless through `run_engine`. The default `--format text` renderer prints the CPU summary, seed, tracked per-event register deltas, static not-reached rows, and outcome. `--format json` sends the complete trace to `write_trace_json`; it always contains full register state and rejects an explicit `--track`. `--pretty` adds indentation and requires `--quick --format json`. Supplied-code faults remain successful traces. Engine or instrumentation errors emit a complete JSON document and return nonzero. Invalid CLI or byte input emits no JSON. `--seed name=value,...` sets initial state. Values can be hex, a finite decimal containing `.`, or `inf`/`nan`, with an optional `f`/`F` single-precision suffix or `l`/`L` double-precision suffix. Names are any GPR slice (`RAX`/`EAX`/`AX`/`AH`/`AL`, not `RSP`), `XMM0..15`, `ST0..7`, or a status flag (`CF/PF/AF/ZF/SF/DF/OF`). `CLI::parse` validates and stores the raw text (`seed_gpr`/`seed_flags`/`seed_xmm`/`seed_st`), feeding both the TUI seed inputs and `--quick`, which compose it (`compose_gpr_seed`/`compose_xmm_seed`/`compose_st_seed`) so narrower GPR slices overlay wider ones.
 
-argparse gotcha. On `--syntax` and `--backend`, the `.nargs(1)` *after* `.default_value(...)`
-is load-bearing - `default_value` resets the nargs min to 0, which would make an
-invalid `--syntax` value parse as a stray positional instead of a clean "allowed
-options" error. Keep that ordering.
+argparse gotcha. On `--syntax`, `--backend`, and `--format`, the `.nargs(1)` *after* `.default_value(...)`
+is load-bearing. `default_value` resets the nargs min to 0, which would make an invalid value parse as a
+stray positional instead of a clean allowed-options error. Keep that ordering.
 
 ## Project meta
 
