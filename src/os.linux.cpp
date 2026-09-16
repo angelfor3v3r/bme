@@ -260,7 +260,7 @@ void child_main(const PlatformRunRequest &request, int ready_descriptor, std::si
         _exit(1);
     }
 
-    raise(SIGSTOP);
+    (void)raise(SIGSTOP);
     _exit(1);
 }
 

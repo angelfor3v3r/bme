@@ -1,9 +1,12 @@
 #pragma once
 
+#include "cpu.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <iosfwd>
 #include <optional>
 #include <span>
 #include <string>
@@ -80,6 +83,12 @@ enum class DisasmBackend : std::uint8_t
     Xed,
 };
 
+enum class OutputFormat : std::uint8_t
+{
+    Text = 0,
+    Json,
+};
+
 // Register classes that `--quick` diffs and prints, selected by `--track`.
 struct TrackMask
 {
@@ -144,28 +153,53 @@ struct Registers
     std::uint8_t                                fpu_tag_word_abridged{}; // `FXSAVE` abridged tag (1 bit/reg), not the 16-bit x87 tag word.
 };
 
-struct Step
+enum class ExecutionEventKind : std::uint8_t
 {
-    // Instruction.
-    std::uint64_t             rip{};   // Instruction or data address.
-    std::vector<std::uint8_t> bytes{}; // Machine code.
-    std::string               text{};  // Disassembled instruction (decoder mnemonic + operands). "(bad)" if undecodable.
+    Completed = 0,
+    Faulted,
+};
 
-    // Register state after a completed instruction or at an exception.
-    Registers registers{};
+struct ExecutionEvent
+{
+    std::uint64_t      rip{};
+    Registers          registers{};
+    ExecutionEventKind kind = ExecutionEventKind::Completed;
+};
 
-    // Classification.
-    bool reached{}; // Completed instruction.
-    bool faulted{}; // Faulting instruction with exception-time partial state.
-    bool data{};    // Raw bytes shown as "(data)", not an instruction. Skip on re-disassembly.
+enum class HistoryRowKind : std::uint8_t
+{
+    Reached = 0,
+    Faulted,
+    NotReached,
+    Data,
+};
+
+struct HistoryRow
+{
+    std::uint64_t              rip{};
+    std::string                text{};
+    std::size_t                offset{};
+    std::size_t                length{};
+    HistoryRowKind             kind = HistoryRowKind::NotReached;
+    std::optional<std::size_t> execution_event_index{};
 };
 
 struct Trace
 {
+    // Host provenance.
+    std::shared_ptr<const CPUFingerprint> cpu_fingerprint{}; // Non-null for traces returned by `run_engine`.
+
+    // Execution request.
+    std::vector<std::uint8_t> code{};
+    Registers                 requested_seed{};
+    DisasmBackend             requested_backend = DisasmBackend::Zydis;
+    DisasmSyntax              requested_syntax  = DisasmSyntax::Intel;
+    std::size_t               effective_max_steps{};
+    bool                      seed_data_pointers{};
+
     // Recorded execution.
-    std::vector<std::uint8_t> code{}; // Original input bytes.
-    Registers                 seed{}; // State before step 0.
-    std::vector<Step>         steps{};
+    Registers                   seed{}; // Actual state before event 0.
+    std::vector<ExecutionEvent> execution_events{};
 
     // Outcome.
     Outcome       outcome = Outcome::Idle;
@@ -183,6 +217,8 @@ struct CLI
     std::optional<std::string> bytes{};
     bool                       run{};
     bool                       quick{};
+    OutputFormat               format = OutputFormat::Text;
+    bool                       pretty_json{};
 
     // Run settings.
     DisasmSyntax  syntax    = DisasmSyntax::Intel;
@@ -221,7 +257,12 @@ Trace run_engine(
     std::span<std::uint8_t> code, const Registers &seed, std::size_t max_steps, DisasmBackend backend, DisasmSyntax syntax, bool seed_data_pointers
 );
 
-void redisasm(Trace &trace, DisasmBackend backend, DisasmSyntax syntax);
+bool                    backend_supports(DisasmBackend backend, DisasmSyntax syntax) noexcept;
+std::vector<HistoryRow> build_history(const Trace &trace, DisasmBackend backend, DisasmSyntax syntax);
+
+// Writes one newline-terminated document and flushes the output stream.
+// A trace without a CPU fingerprint is rejected before writing.
+Result<void, std::string> write_trace_json(const Trace &trace, std::ostream &output, bool pretty = false);
 
 std::int32_t run_quick(const CLI &cli);
 std::int32_t run_tui(const CLI &cli);
