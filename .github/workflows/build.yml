@@ -6,6 +6,10 @@ on:
     branches: [main]
     tags: ['v*']
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 permissions:
   contents: read
 
@@ -13,6 +17,7 @@ jobs:
   format:
     name: clang-format
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -50,6 +55,7 @@ jobs:
     name: windows x86-64 clang
     needs: format
     runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -66,7 +72,7 @@ jobs:
           if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
             choco install ninja -y --no-progress
           }
-          echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+          "C:\Program Files\LLVM\bin" | Add-Content -Path $env:GITHUB_PATH -Encoding utf8
 
       - name: Ensure Python is available
         id: python_check
@@ -74,9 +80,9 @@ jobs:
         run: |
           if (Get-Command python -ErrorAction SilentlyContinue) {
             python --version
-            "install=false" >> $env:GITHUB_OUTPUT
+            "install=false" | Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8
           } else {
-            "install=true" >> $env:GITHUB_OUTPUT
+            "install=true" | Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8
           }
 
       - name: Set up Python
@@ -96,17 +102,53 @@ jobs:
 
       - name: Smoke test
         shell: pwsh
-        run: .\build\bme.exe --bytes 48FFC0 --quick --seed rax=64
+        run: |
+          $versionOutput = .\build\bme.exe --version | Out-String
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $versionOutput.TrimEnd() | Write-Host
+          if ($versionOutput.Contains("unknown")) {
+            throw "The built executable has unknown version metadata."
+          }
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and
+              -not $versionOutput.Contains("bme version $env:GITHUB_REF_NAME (")) {
+            throw "The built executable does not report the release tag."
+          }
+          .\build\bme.exe --bytes 48FFC0 --quick --seed rax=64
 
       - name: Package
         shell: pwsh
         run: |
-          $version = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}".Substring(1) } else { "dev" }
+          $version = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME.Substring(1) } else { "dev" }
           $packageName = "bme-$version-windows-x86_64"
           $packageRoot = Join-Path "build/package" $packageName
           New-Item -ItemType Directory -Force $packageRoot
           Copy-Item build/bme.exe, LICENSE, THIRD_PARTY_LICENSES.md -Destination $packageRoot
           Compress-Archive -Path $packageRoot -DestinationPath "build/package/$packageName.zip"
+          "BME_WINDOWS_PACKAGE_NAME=$packageName" | Add-Content -Path $env:GITHUB_ENV -Encoding utf8
+
+      - name: Smoke test packaged executable
+        shell: pwsh
+        run: |
+          Expand-Archive -Path "build/package/$env:BME_WINDOWS_PACKAGE_NAME.zip" -DestinationPath build/package-smoke
+          $packagedExecutable = "build/package-smoke/$env:BME_WINDOWS_PACKAGE_NAME/bme.exe"
+          $versionOutput = & $packagedExecutable --version | Out-String
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $versionOutput.TrimEnd() | Write-Host
+          if ($versionOutput.Contains("unknown")) {
+            throw "The packaged executable has unknown version metadata."
+          }
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and
+              -not $versionOutput.Contains("bme version $env:GITHUB_REF_NAME (")) {
+            throw "The packaged executable does not report the release tag."
+          }
+          & $packagedExecutable --bytes 48FFC0 --quick --seed rax=64
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -118,43 +160,104 @@ jobs:
     name: debian 12 x86-64 clang
     needs: format
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container: debian:12
+    defaults:
+      run:
+        shell: bash
     steps:
+      - name: Install build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y ca-certificates curl git ninja-build python3 python3-pip dpkg-dev file build-essential gnupg
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
+          fingerprint=$(gpg --show-keys --with-colons /tmp/llvm-snapshot.gpg.key | awk -F: '$1 == "fpr" { print $10; exit }')
+          test "$fingerprint" = "6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
+          gpg --dearmor --yes --output /usr/share/keyrings/llvm-archive-keyring.gpg /tmp/llvm-snapshot.gpg.key
+          printf '%s\n' "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/bookworm/ llvm-toolchain-bookworm-22 main" \
+            > /etc/apt/sources.list.d/llvm.list
+          apt-get update
+          apt-get install -y clang-22 lld-22
+          python3 -m pip install --break-system-packages cmake==3.31.10
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - name: Build, test, package, and smoke test
+      - name: Configure
         run: |
-          docker run --rm --volume "$GITHUB_WORKSPACE:/src" --workdir /src debian:12 bash -lc '
-            set -eux
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            apt-get install -y ca-certificates curl git ninja-build python3 python3-pip dpkg-dev file build-essential gnupg
-            git config --global --add safe.directory /src
-            curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
-            fingerprint=$(gpg --show-keys --with-colons /tmp/llvm-snapshot.gpg.key | awk -F: '"'"'$1 == "fpr" { print $10; exit }'"'"')
-            test "$fingerprint" = "6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
-            gpg --dearmor --yes --output /usr/share/keyrings/llvm-archive-keyring.gpg /tmp/llvm-snapshot.gpg.key
-            printf "%s\n" "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/bookworm/ llvm-toolchain-bookworm-22 main" > /etc/apt/sources.list.d/llvm.list
-            apt-get update
-            apt-get install -y clang-22 lld-22
-            python3 -m pip install --break-system-packages cmake==3.31.10
-            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 -DBME_BUILD_TESTS=ON
-            cmake --build build --parallel
-            version_output=$(./build/bme --version)
-            printf '%s\n' "$version_output"
-            [[ "$version_output" != *unknown* ]]
-            ctest --test-dir build --output-on-failure
-            ./build/bme --bytes 48FFC0 --quick --seed rax=64
-            cpack --config build/CPackConfig.cmake -G DEB -B build/package
-            cpack --config build/CPackConfig.cmake -G TGZ -B build/package
-            dpkg-deb --info build/package/*.deb
-            dpkg --install build/package/*.deb
-            /usr/bin/bme --bytes 48FFC0 --quick --seed rax=64
-            mkdir build/tar-root
-            tar --extract --file build/package/*.tar.gz --strip-components=1 -C build/tar-root
-            build/tar-root/bin/bme --bytes 48FFC0 --quick --seed rax=64
-          '
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang-22 \
+            -DCMAKE_CXX_COMPILER=clang++-22 \
+            -DBME_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Smoke test
+        run: |
+          version_output=$(./build/bme --version)
+          printf '%s\n' "$version_output"
+          [[ "$version_output" != *unknown* ]]
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            [[ "$version_output" == *"bme version $GITHUB_REF_NAME ("* ]]
+          fi
+          ./build/bme --bytes 48FFC0 --quick --seed rax=64
+
+      - name: Package
+        run: |
+          cpack --config build/CPackConfig.cmake -G DEB -B build/package
+          cpack --config build/CPackConfig.cmake -G TGZ -B build/package
+
+      - name: Verify Debian package
+        run: |
+          package_paths=(build/package/*.deb)
+          [[ ${#package_paths[@]} -eq 1 && -f "${package_paths[0]}" ]]
+          package_version=$(dpkg-deb --field "${package_paths[0]}" Version)
+          printf 'Debian package version: %s\n' "$package_version"
+          dpkg-deb --info "${package_paths[0]}"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            expected_version=${GITHUB_REF_NAME#v}
+            expected_stem="bme-$expected_version-linux-x86_64"
+            [[ "$(basename "${package_paths[0]}" .deb)" == "$expected_stem" ]]
+            [[ "$package_version" == "$expected_version" ]]
+          fi
+          dpkg --install "${package_paths[0]}"
+          version_output=$(/usr/bin/bme --version)
+          printf '%s\n' "$version_output"
+          [[ "$version_output" != *unknown* ]]
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            [[ "$version_output" == *"bme version $GITHUB_REF_NAME ("* ]]
+          fi
+          /usr/bin/bme --bytes 48FFC0 --quick --seed rax=64
+
+      - name: Verify TGZ package
+        run: |
+          archive_paths=(build/package/*.tar.gz)
+          [[ ${#archive_paths[@]} -eq 1 && -f "${archive_paths[0]}" ]]
+          archive_root=$(basename "${archive_paths[0]}" .tar.gz)
+          archive_entries=$(tar --list --file "${archive_paths[0]}" | cut --delimiter=/ --fields=1 | sort --unique)
+          printf 'TGZ root: %s\n' "$archive_entries"
+          [[ "$archive_entries" == "$archive_root" ]]
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            expected_version=${GITHUB_REF_NAME#v}
+            [[ "$archive_root" == "bme-$expected_version-linux-x86_64" ]]
+          fi
+          mkdir build/tar-root
+          tar --extract --file "${archive_paths[0]}" --strip-components=1 -C build/tar-root
+          version_output=$(build/tar-root/bin/bme --version)
+          printf '%s\n' "$version_output"
+          [[ "$version_output" != *unknown* ]]
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            [[ "$version_output" == *"bme version $GITHUB_REF_NAME ("* ]]
+          fi
+          build/tar-root/bin/bme --bytes 48FFC0 --quick --seed rax=64
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -169,6 +272,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [windows, linux]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -177,6 +281,21 @@ jobs:
           path: release
           merge-multiple: true
 
+      - name: Verify release artifacts
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          expected_artifacts=(
+            "release/bme-$version-windows-x86_64.zip"
+            "release/bme-$version-linux-x86_64.deb"
+            "release/bme-$version-linux-x86_64.tar.gz"
+          )
+          for artifact in "${expected_artifacts[@]}"; do
+            [[ -f "$artifact" ]]
+          done
+          mapfile -t release_artifacts < <(find release -maxdepth 1 -type f)
+          [[ ${#release_artifacts[@]} -eq ${#expected_artifacts[@]} ]]
+
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: release/*
+          fail_on_unmatched_files: true

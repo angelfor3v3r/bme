@@ -5,7 +5,7 @@ Hard, always-apply rules. Background and implementation detail live in AGENTS.md
 ## Git
 
 - NEVER commit, push, stage (`git add`), or create a commit, tag, or branch. The user handles Git state.
-- Leave the pre-commit hook and `.github/workflows` alone.
+- Leave the pre-commit hook and `.github/workflows` alone unless the user explicitly requests changes to them.
 
 ## Build and generated files
 
