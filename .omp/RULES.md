@@ -33,9 +33,11 @@ Hard, always-apply rules. Background and implementation detail live in AGENTS.md
 ## Code style
 
 - Use C-style casts such as `(std::size_t)x`. Never use C++ named casts.
-- Do not add `const` to local variables or pointer arguments. Use it on references and member functions where meaningful.
+- Do not add plain `const` to local variables or pointer arguments. Use `constexpr` for genuine compile-time invariants at local, namespace, or header scope. Use `const` on references and member functions where meaningful.
 - Zero-initialize with `{}`, never `= 0`.
-- Prefer `auto`.
+- Prefer named types when they add information. Use `auto` when the type is already clear from the initializer, return expression, or named object returned by the function. Accessors returning `std::get<T>(...)` and functions returning a locally declared result should use `auto`.
+- For direct construction, put the type on the declaration (`std::array<...> expected{...}`), not in a same-type temporary (`auto expected = std::array<...>{...}`).
+- Choose one source of scalar type information. Use a named type with an unsuffixed direct literal, or `auto` with a typed literal. Keep a suffix when it controls expression semantics before assignment.
 - Use `emplace_back`, never `push_back`.
 - C++ library and OS code lives in `namespace bme`. Keep `main` thin. Never use `using namespace ftxui`; qualify `ftxui::`. `using namespace bme` is test-only.
 - Test plain bitmasks with `!= 0` or `== 0`. Compare with a flag value only when testing that exact flag. Avoid redundant parentheses around bitwise expressions.

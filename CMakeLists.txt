@@ -268,7 +268,7 @@ function(bme_apply_warnings target)
     endif ()
 endfunction()
 
-# Isolate Glaze headers and interface flags to the serializer translation unit.
+# Keep Glaze out of the shared core and production headers.
 add_library(bme_serializer OBJECT src/trace_json.cpp)
 bme_apply_common_config(bme_serializer)
 bme_apply_warnings(bme_serializer)
@@ -325,9 +325,9 @@ if (BME_BUILD_TESTS)
     enable_testing()
     include(GoogleTest)
     add_executable(bme_tests
-        test/main.cpp
         test/cpu_test.cpp
         test/parse_test.cpp
+        test/util_test.cpp
         test/environment_test.cpp
         test/seed_test.cpp
         test/cli_test.cpp
@@ -335,6 +335,9 @@ if (BME_BUILD_TESTS)
         test/trace_json_test.cpp
         test/quick_test.cpp)
     bme_apply_common_config(bme_tests)
-    target_link_libraries(bme_tests PRIVATE bme_core GTest::gtest)
+
+    # Use Glaze's generic reader to inspect serializer output without a private JSON parser.
+    target_compile_definitions(bme_tests PRIVATE GLZ_USE_STD_FORMAT_FLOAT=0)
+    target_link_libraries(bme_tests PRIVATE bme_core glaze::glaze GTest::gtest_main)
     gtest_discover_tests(bme_tests)
 endif ()

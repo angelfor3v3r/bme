@@ -31,10 +31,10 @@ src/cpu.hpp          # CPU fingerprint data model and injectable CPUID query con
 src/cpu.cpp          # CPUID/XGETBV collection, decoding, process cache, and summary formatting
 src/trace_json.cpp   # isolated Glaze adapter and streaming versioned JSON writer
 src/os.hpp           # private VM, environment, clipboard, and stepping contract
-src/os.cpp           # shared platform-run preflight
+src/os.cpp           # shared scratch layout and platform-run preflight
 src/os.windows.cpp   # Windows VM, VEH, clipboard, environment, and stepping implementation
 src/os.linux.cpp     # Linux mmap, ptrace, terminal clipboard, environment, and stepping implementation
-src/main.cpp         # thin entry. Parses args, calls bme::init then run_quick / run_tui
+src/main.cpp         # thin entry. Parses args, then calls run_quick / run_tui
 src/st80.asm         # x87 80-bit conversion leaves for Win64 MASM
 src/st80.S           # x87 80-bit conversion leaves for SysV GNU assembler
 test/                # GoogleTest suite for the headless path (links bme_core), built with -DBME_BUILD_TESTS=ON
@@ -72,9 +72,10 @@ cmake --build build
 
 Deps (fmt 12.2.0, argparse 3.2, Glaze 8.3.0, FTXUI 7.0.3, Zydis `a95bb710...`, bddisasm `3.0.1`,
 Capstone `5.0.9`) are fetched by CPM. Zydis also builds its pinned Zycore support library. The `URI`
-form auto-applies `EXCLUDE_FROM_ALL`/`SYSTEM`, so third-party headers stay out of `-Werror`. Glaze is
-private to the `bme_serializer` object target. Intel XED (`v2026.08.23` plus its mbuild) has no CMake,
-so CPM downloads it and an ExternalProject builds it via `mfile.py` (`cmake/XED.cmake`) - needs Python 3.
+form auto-applies `EXCLUDE_FROM_ALL`/`SYSTEM`, so third-party headers stay out of `-Werror`. Production
+Glaze use is private to `bme_serializer`. Tests link it only for generic JSON schema inspection. Intel
+XED (`v2026.08.23` plus its mbuild) has no CMake, so CPM downloads it and an ExternalProject builds it
+via `mfile.py` (`cmake/XED.cmake`) - needs Python 3.
 All slow on first configure.
 
 CI is the authoritative formatting check. Contributors may enable the tracked pre-commit hook explicitly:
@@ -101,7 +102,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-- The `bme_core` split exists for this. The static lib (`namespace bme`) holds all logic, so tests link it and call CPU decoding, parsers, seed composition, CLI, environment, instrumentation preflight, history construction, JSON serialization, quick utilities, and focused engine orchestration contracts directly. `bme_tests` links `bme_core` + `GTest::gtest` with a custom `main` (`test/main.cpp`) that calls `bme::init`. It is exempt from `-Werror` so GoogleTest macros can't fail the CI build.
+- The `bme_core` split exists for this. The static lib (`namespace bme`) holds all logic, so tests link it and call CPU decoding, parsers, seed composition, CLI, environment, instrumentation preflight, history construction, JSON serialization, quick utilities, and focused engine orchestration contracts directly. `bme_tests` links `bme_core` + `GTest::gtest_main`. It is exempt from `-Werror` so GoogleTest macros can't fail the CI build.
 - `test/test_helpers.hpp` holds the shared environment-variable scope, CLI argument builder, and stdout/stderr capture used by utility tests.
 - Scope. Test BME behavior that we own. Engine tests cover orchestration such as fault-state classification, instrumentation refusal, and concurrent-call isolation. Serializer tests cover schema shape, exact machine-state encoding, provenance, nulls, decoder histories, and output failures. Do not assert decoder correctness, CPU instruction semantics, ASLR-dependent registers, or decoder-specific text.
 - Keep engine cases bounded to safe byte sequences and stable architectural outcomes.
@@ -114,9 +115,20 @@ These were corrected repeatedly across the session. Match them exactly.
 - **Namespace** - C++ library and OS code lives in `namespace bme`; `src/main.cpp` remains a thin
   global entry. Still qualify `ftxui::`, never `using namespace ftxui`. `using namespace bme` is
   allowed only in test-only code.
-- **No `const` on local variables** inside functions (useless). `const` only on
-  references where it makes sense and on member functions. Not on pointer args.
-- **Prefer `auto`** wherever possible.
+- **Immutability** - Do not add plain `const` to local variables. Use `constexpr` for genuine
+  compile-time invariants at local, namespace, or header scope. `const` remains appropriate on
+  references and member functions. Not on pointer args.
+- **Prefer named types when they add information.** Use `auto` when spelling the type would repeat a
+  type already clear from the initializer, return expression, or named object returned by the
+  function. Accessors returning `std::get<T>(...)` and functions returning a locally declared result
+  should use `auto`. Also use `auto` for long, redundant, or unnameable types such as lambda closures.
+- **Direct construction** - Put the type on the declaration (`std::array<...> expected{...}`), not
+  in a same-type temporary (`auto expected = std::array<...>{...}`).
+- **Choose one source of scalar type information.** Use a named type with an unsuffixed direct
+  literal, or `auto` with a typed literal. Do not spell both (`constexpr auto leaf = 0u;`, not
+  `constexpr std::uint32_t leaf = 0u;`). Keep a suffix when it controls expression semantics before
+  assignment. With `constexpr auto`, the suffix pins the intended type
+  (`constexpr auto iterations = 2000ull;`).
 - Zero-init with **`{}`**, never `= 0`.
 - **`emplace_back`** over `push_back`.
 - **Bitwise checks must be explicit and semantically correct.** Use `!= 0` /
@@ -144,8 +156,8 @@ Never run clang-format on `src/st80.asm` or `src/st80.S`.
   `fpu_control_word`, `fpu_status_word`, `fpu_tag_word_abridged`
   (FXSAVE 1-bit/reg, not the 16-bit x87 tag word). `operator[](Reg)`.
 - `CPUFingerprint` stores process-visible CPUID identity, feature masks, XSAVE/XSTATE data, address widths, hypervisor data, and raw queried leaf/subleaf records. `host_cpu_fingerprint()` caches one immutable process snapshot shared by traces. `CPUQuerySource` makes collection deterministic in tests.
-- `ExecutionEvent` stores only CPU execution state: RIP, the full register snapshot, and completed/faulted classification. It has no decoder text or instruction-length fields.
-- `Trace` separates the request (`code`, requested seed/backend/syntax, effective step cap, scratch-pointer policy), recorded execution (`seed`, raw `execution_events`), host CPU fingerprint, and outcome. `Outcome::Error` identifies engine or instrumentation failure, while `Outcome::Faulted` identifies a fault raised by supplied bytes. `stop_reason` records why execution halted and labels stop, fault, or not-reached rows where applicable. `stop_address` anchors an `int3` or fault.
+- `ExecutionEvent` stores only CPU execution state: RIP, the full register snapshot, and completed/faulted classification. It has no decoder text or instruction-length fields. Fault-time RFLAGS preserves processor exception-delivery changes such as RF being set for fault-class exceptions.
+- `Trace` separates the request (`code`, requested seed/backend/syntax, effective step cap, scratch-pointer policy), recorded execution (`seed`, raw `execution_events`), host CPU fingerprint, and outcome. `Outcome::Error` identifies engine or instrumentation failure, while `Outcome::Faulted` identifies a fault raised by supplied bytes. `stop_reason` records why execution halted and labels stop, fault, or not-reached rows where applicable. `stop_address` anchors an `int3`, fault, or selected-row stop.
 - `build_history` overlays one decoder's instruction boundaries on immutable trace code and execution events. Static rows stop before every execution-event start, even when a decoder's linear instruction would cross that later entry point. `HistoryRow` maps reached and faulted rows back through `execution_event_index` without copying register snapshots. Multiple backend histories can coexist without mutating `Trace`.
 - `write_trace_json` streams compact or two-space-indented schema version 1 JSON through the Glaze-only `bme_serializer` translation unit. The document includes producer and dependency revisions, host and CPU provenance, request state, full execution snapshots, outcome, and all four decoder histories. Integer machine state uses fixed-width hexadecimal strings. Stable unavailable values use `null`. The writer appends one newline and reports serialization or stream failures.
 - Platform execution lives behind the private `os.hpp` contract. `os.cpp` handles shared preflight,
@@ -154,10 +166,12 @@ Never run clang-format on `src/st80.asm` or `src/st80.S`.
   mappings and a traced child with `PTRACE_SINGLESTEP`, `PTRACE_O_EXITKILL`, and `PTRACE_GETFPREGS`.
   Both platforms use guarded 64 KiB scratch stack and data regions. The data mapping reserves at
   `SCRATCH_DATA_RESERVE_BASE`, never relocates, and exposes usable bytes one guard page above it.
-  RDI and RSI default to that usable address unless seeded. The step cap defaults to 50k and clamps
-  to `MAX_STEPS_LIMIT`, but it does not bound wall-clock time. A blocking system call can stall a run.
+  RDI and RSI default to that usable address unless seeded. An optional stop offset is resolved against
+  each run's code base and checked after every completed step without patching the input. The step cap
+  defaults to 50k and clamps to `MAX_STEPS_LIMIT`, but it does not bound wall-clock time. A blocking
+  system call can stall a run.
 - Linux asks Zydis to identify software-breakpoint instructions only after ptrace reports a breakpoint-class `SIGTRAP`. This avoids handwritten x86 parsing and distinguishes WSL2's ambiguous syscall completion trap. The runtime check does not use the selected display backend.
-- `parse_hex` (`std::from_chars`, `Result`/`std::expected`-based), `parse_seed`.
+- `parse_code_text` accepts contiguous or whitespace-separated hex, `\xNN` escapes, and `{ 0xNN, ... }` byte arrays. `--file` reads up to 15,000,000 exact bytes from a raw binary file. It never infers a text encoding. `--bytes` and `--file` are mutually exclusive.
 - Decode backends (`DisasmBackend`). `disasm_one(backend, syntax, addr, code, size)` -> `Decoded`
   (`ok`/`text`/`length`), dispatching to **Zydis** (Intel + AT&T), **bddisasm** (Intel only), **Capstone** (Intel + AT&T), or **XED** (Intel + AT&T),
   gated by `backend_supports`, which reads the per-decoder `BACKENDS` capability table. `run_engine` records decoder-neutral execution events and
@@ -167,9 +181,9 @@ Never run clang-format on `src/st80.asm` or `src/st80.S`.
   `compose_gpr_seed` - widest non-empty slice is the base, each narrower non-empty
   slice overlays its bits (EAX refines RAX, AL refines AX, ...). Empty slices ignored.
   A malformed slice is skipped (never zeroed over a wider slice) and reported, not
-  discarded. `compose_seed` composes a full `Registers` (GPR + RFLAGS + XMM + ST) from
+  discarded. `compose_seed` composes a full `Registers` (GPR + RFLAGS + XMM + ST + MXCSR + x87 control word) from
   the seed text and collects every such error, shared by the TUI's Run and `--quick`.
-  The TUI stays lenient. A bad field remains unseeded, its error is appended to `ui.status`, and the
+  The TUI stays lenient. A bad field retains its default, its error is appended to `ui.status`, and the
   run proceeds. `--quick` uses the same composer, but `CLI::parse` validates every field first, so a
   composition error there is treated as unreachable and fails loudly.
 - XMM/x87 seeding follows the same text-field model. `compose_xmm_seed` (128-bit `{lo, hi}`) and
@@ -177,10 +191,11 @@ Never run clang-format on `src/st80.asm` or `src/st80.S`.
   or a decimal with a `.` or a non-finite `inf`/`nan` value, and an optional trailing `f`/`F` (single
   precision) or `l`/`L`/none (double), via `parse_decimal_seed`.
   XMM places single in the low 32 bits (f32x4 lane 0) and double in the low 64 bits (f64x2 lane 0).
-  x87 rounds the value to 80-bit via `double_to_st80`. Both backends begin with the x87 reset
-  control, status, and tag state plus `MXCSR` `0x1F80`, then apply XMM and x87 seeds to the native
-  context, establish `TOP` 0, and mark seeded x87 slots non-empty. Windows uses `FltSave`; Linux uses
-  `user_fpregs_struct`.
+  x87 rounds the value to 80-bit via `double_to_st80`. `FloatingEnvironmentSeed` carries optional raw
+  hexadecimal `MXCSR` and `control_word` text. Both backends reset x87 status and tag state, apply the composed
+  control words plus XMM and x87 seeds to the native context, establish `TOP` 0, and mark seeded x87
+  slots non-empty. Windows uses `FltSave`; Linux uses `user_fpregs_struct`. MXCSR bits unsupported by
+  the live context's mask fail the run rather than being silently cleared.
   The x87 conversion leaves preserve the caller's control word and apply only the captured rounding-control bits.
   `render_xmm` always shows the `f64x2` decimal row when a trace exists, with
   `f32x4` behind the click-to-expand toggle (`ui.xmm_expand`), each lane its own `copy_cell`.
@@ -274,28 +289,38 @@ Never run clang-format on `src/st80.asm` or `src/st80.S`.
   fault row is anchored at the CPU's instruction address and exposes exception-time partial state without
   incrementing the executed count. Instruction-fetch fault addresses outside `Trace::code` are not decoded
   as history rows. Switching tabs preserves the selected state or byte address even when decoder boundaries
-  differ. The History wheel (`history_view` `CatchEvent`) steps `ui.cursor` within the active tab.
-- Tabs are GPR / SSE / x87. Buttons are Run / Step / Back / Reset / Settings /
-  About / Quit - keyboard `F5`/`F8`/`F7` run/step/back via a layout `CatchEvent`
-  (suppressed while a modal is open). Flags panel (`render_flags`/`flags_view`) is
-  clickable to seed status flags. Settings modal holds the disasm syntax, decode backend, single-step cap
-  (`ui.max_steps`), and an RDI/RSI-to-scratch toggle (`ui.seed_data_pointers`). About modal shows version / repo / copyright. `Reset` clears the run but keeps your seeds.
+  differ. Reached rows render normally, faults in red, stop rows emphasized, and static rows dimmed.
+  Code and scratch-data addresses use `code+offset` and `data+offset` forms by default. The header shows
+  clickable absolute code and data bases, while Settings can switch register and History values back to
+  absolute addresses. **Copy row** copies the selected rendered row. The History wheel (`history_view`
+  `CatchEvent`) steps `ui.cursor` within the active tab.
+- Tabs are GPR / SSE / x87. Buttons are Run / Run to row / Step / Back / Copy row / Reset / Settings /
+  About / Quit. **Run to row** reruns from the configured seed and stops before the selected byte offset.
+  Keyboard `F5`/`F8`/`F7` runs, steps, and backs. Layout shortcuts are suppressed while a modal is open.
+  Flags panel (`render_flags`/`flags_view`) is clickable for seedable status flags. It shows RF as read-only
+  exception state only when set on the selected fault row. The SSE and x87 tabs expose `MXCSR` and
+  control-word seed inputs. Settings holds the disasm syntax, decode backend, single-step cap
+  (`ui.max_steps`), scratch-pointer toggle (`ui.seed_data_pointers`), and normalized-address display.
+  About shows version / repo / copyright. `Reset` clears the run but keeps your seeds.
 
 ## CLI
 
 ```
-bme --bytes 48FFC0 --run                 # inc rax, run on launch
+bme --bytes 48ffc0 --run                 # inc rax, run on launch
+bme --bytes "\x48\xFF\xC0"               # C-style escaped bytes
+bme --bytes "{ 0x48, 0xFF, 0xC0 }"       # C-style byte array
+bme --file code.bin --quick              # raw binary file
 bme --bytes 48C7C001000000 --syntax att  # AT&T disasm (default intel)
-bme --bytes 48FFC0 --backend bddisasm    # decode with bddisasm instead of Zydis (Intel only)
+bme --bytes 48ffc0 --backend bddisasm    # decode with bddisasm instead of Zydis (Intel only)
 bme --max-steps 200000                   # raise the single-step cap
 bme --version                            # tag/hash/url, clang-format style
-bme --bytes 48FFC0 --quick               # headless trace dump to stdout (--track picks register classes)
-bme --bytes 48FFC0 --quick --format json # versioned full-state JSON trace
-bme --bytes 48FFC0 --quick --format json --pretty # indented full-state JSON trace
-bme --bytes 48F7F3 --quick --seed rax=64,rbx=9 # seed GPRs/XMM/ST/flags before the run (hex or a decimal)
+bme --bytes 48ffc0 --quick               # headless trace dump to stdout (--track picks register classes)
+bme --bytes 48ffc0 --quick --format json # versioned full-state JSON trace
+bme --bytes 48ffc0 --quick --format json --pretty # indented full-state JSON trace
+bme --bytes 90 --quick --seed mxcsr=5f80,control_word=27f # seed SSE and x87 control state
 ```
 
-`--quick` runs headless through `run_engine`. The default `--format text` renderer prints the CPU summary, seed, tracked per-event register deltas, static not-reached rows, and outcome. `--format json` sends the complete trace to `write_trace_json`; it always contains full register state and rejects an explicit `--track`. `--pretty` adds indentation and requires `--quick --format json`. Supplied-code faults remain successful traces. Engine or instrumentation errors emit a complete JSON document and return nonzero. Invalid CLI or byte input emits no JSON. `--seed name=value,...` sets initial state. Values can be hex, a finite decimal containing `.`, or `inf`/`nan`, with an optional `f`/`F` single-precision suffix or `l`/`L` double-precision suffix. Names are any GPR slice (`RAX`/`EAX`/`AX`/`AH`/`AL`, not `RSP`), `XMM0..15`, `ST0..7`, or a status flag (`CF/PF/AF/ZF/SF/DF/OF`). `CLI::parse` validates and stores the raw text (`seed_gpr`/`seed_flags`/`seed_xmm`/`seed_st`), feeding both the TUI seed inputs and `--quick`, which compose it (`compose_gpr_seed`/`compose_xmm_seed`/`compose_st_seed`) so narrower GPR slices overlay wider ones.
+`--quick` runs headless through `run_engine`. The default `--format text` renderer prints the CPU summary, seed, tracked per-event register deltas, static not-reached rows, and outcome. `--format json` sends the complete trace to `write_trace_json`; it always contains full register state and rejects an explicit `--track`. `--pretty` adds indentation and requires `--quick --format json`. Supplied-code faults remain successful traces. Engine or instrumentation errors emit a complete JSON document and return nonzero. Invalid CLI or byte input emits no JSON. `--bytes` accepts formatted text and `--file` reads a raw binary file. `--seed name=value,...` sets initial state. GPRs, flags, `MXCSR`, and `control_word` use hex. XMM and ST also accept finite decimals containing `.`, or `inf`/`nan`, with an optional `f`/`F` single-precision suffix or `l`/`L` double-precision suffix.
 
 argparse gotcha. On `--syntax`, `--backend`, and `--format`, the `.nargs(1)` *after* `.default_value(...)`
 is load-bearing. `default_value` resets the nargs min to 0, which would make an invalid value parse as a

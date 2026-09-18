@@ -206,6 +206,34 @@ TEST(RunEngineLimits, ZeroStillAllowsOneStep)
     EXPECT_EQ(std::ranges::count(trace.execution_events, ExecutionEventKind::Faulted, &ExecutionEvent::kind), 0);
 }
 
+TEST(RunEngineStopOffset, StopsBeforeSelectedInstruction)
+{
+    std::array<std::uint8_t, 6> code{0x48, 0xFF, 0xC0, 0x48, 0xFF, 0xC0};
+    Registers                   seed{};
+    auto                        trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true, 3);
+    EXPECT_EQ(trace.outcome, Outcome::Stopped);
+    ASSERT_EQ(trace.execution_events.size(), 1u);
+    EXPECT_EQ(trace.execution_events[0].kind, ExecutionEventKind::Completed);
+    EXPECT_EQ(trace.stop_address, trace.seed[Reg::RIP] + 3);
+    EXPECT_EQ(trace.stop_reason, "Stopped here - selected row");
+
+    auto history  = build_history(trace, DisasmBackend::Zydis, DisasmSyntax::Intel);
+    auto selected = std::ranges::find(history, 3u, &HistoryRow::offset);
+    ASSERT_NE(selected, history.end());
+    EXPECT_EQ(selected->kind, HistoryRowKind::NotReached);
+}
+
+TEST(RunEngineStopOffset, StopsAtEntryWithoutExecuting)
+{
+    std::array<std::uint8_t, 1> code{0x90};
+    Registers                   seed{};
+    auto                        trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true, 0);
+    EXPECT_EQ(trace.outcome, Outcome::Stopped);
+    EXPECT_TRUE(trace.execution_events.empty());
+    EXPECT_EQ(trace.stop_address, trace.seed[Reg::RIP]);
+    EXPECT_EQ(trace.stop_reason, "Stopped here - selected row");
+}
+
 TEST(RunEngineFpu, PreservesSeededSseAndX87State)
 {
     std::array<std::uint8_t, 1> code{0x90};
@@ -213,15 +241,16 @@ TEST(RunEngineFpu, PreservesSeededSseAndX87State)
     seed.xmm[0]                = {0x0123'4567'89AB'CDEF, 0xFEDC'BA98'7654'3210};
     seed.st[0]                 = {0, 0, 0, 0, 0, 0, 0, 0x80, 0xFF, 0x3F};
     seed.fpu_tag_word_abridged = 1;
-
-    auto trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
+    seed.mxcsr                 = 0x5F80;
+    seed.fpu_control_word      = 0x027F;
+    auto trace                 = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
     ASSERT_EQ(trace.outcome, Outcome::Finished);
     ASSERT_EQ(trace.execution_events.size(), 1u);
     EXPECT_EQ(trace.execution_events[0].registers.xmm[0], seed.xmm[0]);
     EXPECT_EQ(trace.execution_events[0].registers.st[0], seed.st[0]);
     EXPECT_NE(trace.execution_events[0].registers.fpu_tag_word_abridged & 1, 0);
-    EXPECT_EQ(trace.execution_events[0].registers.fpu_control_word, DEFAULT_FPU_CONTROL_WORD);
-    EXPECT_EQ(trace.execution_events[0].registers.mxcsr, DEFAULT_MXCSR);
+    EXPECT_EQ(trace.execution_events[0].registers.fpu_control_word, seed.fpu_control_word);
+    EXPECT_EQ(trace.execution_events[0].registers.mxcsr, seed.mxcsr);
 }
 
 TEST(RunEngineFpu, DecimalStSeedSurvivesFirstStep)
@@ -229,12 +258,10 @@ TEST(RunEngineFpu, DecimalStSeedSurvivesFirstStep)
     std::array<std::uint8_t, 1>    code{0x90};
     std::array<GPRSeed, GPR_COUNT> gpr{};
     std::array<std::string, 16>    xmm{};
-    std::array<std::string, 8>     st{};
+    std::array<std::string, 8>     st{"1.5"};
     std::vector<std::string>       errors{};
-    st[0] = "1.5";
-
-    auto seed     = compose_seed(gpr, 0, xmm, st, errors);
-    auto expected = std::array<std::uint8_t, 10>{0, 0, 0, 0, 0, 0, 0, 0xC0, 0xFF, 0x3F};
+    auto                           seed = compose_seed(gpr, 0, xmm, st, FloatingEnvironmentSeed{}, errors);
+    std::array<std::uint8_t, 10>   expected{0, 0, 0, 0, 0, 0, 0, 0xC0, 0xFF, 0x3F};
     ASSERT_TRUE(errors.empty());
     EXPECT_EQ(seed.st[0], expected);
 
@@ -279,9 +306,8 @@ TEST(RunEngineSeed, ScratchPointersCanBeDisabled)
 {
     std::array<std::uint8_t, 1> code{0x90};
     Registers                   seed{};
-
-    auto defaults = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
-    auto disabled = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, false);
+    auto                        defaults = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
+    auto                        disabled = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, false);
     ASSERT_EQ(defaults.outcome, Outcome::Finished);
     ASSERT_EQ(disabled.outcome, Outcome::Finished);
     EXPECT_NE(defaults.seed[Reg::RDI], 0ull);
@@ -292,16 +318,17 @@ TEST(RunEngineSeed, ScratchPointersCanBeDisabled)
 
 TEST(RunEngineConcurrency, ConcurrentCallsProduceIndependentTraces)
 {
-    constexpr std::uint64_t     iterations = 2000;
+    constexpr auto ITERATIONS = 2000ull;
+
     std::array<std::uint8_t, 8> code{0x48, 0xFF, 0xC0, 0x48, 0xFF, 0xC9, 0x75, 0xF8};
 
     Registers first_seed{};
     first_seed[Reg::RAX] = 0x1000;
-    first_seed[Reg::RCX] = iterations;
+    first_seed[Reg::RCX] = ITERATIONS;
 
     Registers second_seed{};
     second_seed[Reg::RAX] = 0x2000;
-    second_seed[Reg::RCX] = iterations;
+    second_seed[Reg::RCX] = ITERATIONS;
 
     Trace        first{};
     Trace        second{};
@@ -310,12 +337,12 @@ TEST(RunEngineConcurrency, ConcurrentCallsProduceIndependentTraces)
     std::jthread first_thread{[&]
                               {
                                   start.arrive_and_wait();
-                                  first = run_engine(code, first_seed, iterations * 3, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
+                                  first = run_engine(code, first_seed, ITERATIONS * 3, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
                               }};
     std::jthread second_thread{[&]
                                {
                                    start.arrive_and_wait();
-                                   second = run_engine(code, second_seed, iterations * 3, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
+                                   second = run_engine(code, second_seed, ITERATIONS * 3, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
                                }};
 
     start.arrive_and_wait();
@@ -326,8 +353,8 @@ TEST(RunEngineConcurrency, ConcurrentCallsProduceIndependentTraces)
     ASSERT_EQ(second.outcome, Outcome::Finished);
     ASSERT_FALSE(first.execution_events.empty());
     ASSERT_FALSE(second.execution_events.empty());
-    EXPECT_EQ(first.execution_events.back().registers[Reg::RAX], first_seed[Reg::RAX] + iterations);
-    EXPECT_EQ(second.execution_events.back().registers[Reg::RAX], second_seed[Reg::RAX] + iterations);
+    EXPECT_EQ(first.execution_events.back().registers[Reg::RAX], first_seed[Reg::RAX] + ITERATIONS);
+    EXPECT_EQ(second.execution_events.back().registers[Reg::RAX], second_seed[Reg::RAX] + ITERATIONS);
     EXPECT_EQ(first.execution_events.back().registers[Reg::RCX], 0ull);
     EXPECT_EQ(second.execution_events.back().registers[Reg::RCX], 0ull);
 }

@@ -15,8 +15,6 @@ std::int32_t main(std::int32_t argc, char *argv[], [[maybe_unused]] char *envp[]
         return 1;
     }
 
-    bme::init();
-
     if (cli_result->quick)
     {
         return bme::run_quick(*cli_result);

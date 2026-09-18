@@ -3,9 +3,9 @@
 #include <cmath>
 #include <limits>
 
-TEST(ParseHex, ThreeBytes)
+TEST(ParseCodeText, ThreeBytes)
 {
-    auto bytes = parse_hex("48FFC0");
+    auto bytes = parse_code_text("48FFC0");
     ASSERT_TRUE(bytes);
     ASSERT_EQ(bytes->size(), 3u);
     EXPECT_EQ((*bytes)[0], 0x48);
@@ -13,16 +13,45 @@ TEST(ParseHex, ThreeBytes)
     EXPECT_EQ((*bytes)[2], 0xC0);
 }
 
-TEST(ParseHex, SpacesAllowed)
+TEST(ParseCodeText, BackslashEscapes)
 {
-    auto bytes = parse_hex("48 FF C0");
+    auto bytes = parse_code_text(R"(\x48\xFF\xC0)");
     ASSERT_TRUE(bytes);
-    EXPECT_EQ(bytes->size(), 3u);
+    EXPECT_EQ(*bytes, (std::vector<std::uint8_t>{0x48, 0xFF, 0xC0}));
 }
 
-TEST(ParseHex, WhitespaceAroundAndBetweenBytes)
+TEST(ParseCodeText, BackslashEscapesAllowInterTokenWhitespace)
 {
-    auto bytes = parse_hex(" \t48\n FF\rC0 ");
+    auto bytes = parse_code_text(" \t\\x48\n\\xFF\r\\xC0 ");
+    ASSERT_TRUE(bytes);
+    EXPECT_EQ(*bytes, (std::vector<std::uint8_t>{0x48, 0xFF, 0xC0}));
+}
+
+TEST(ParseCodeText, CByteArraySpacingVariants)
+{
+    std::vector<std::uint8_t> expected{0x48, 0xFF, 0xC0};
+    auto                      compact = parse_code_text("{0x48,0xFF,0xC0}");
+    auto                      padded  = parse_code_text("{ 0x48, 0xFF, 0xC0 }");
+    auto                      mixed   = parse_code_text("{\n\t0x48 , 0xFF,\r\n0xC0 ,\n}");
+    ASSERT_TRUE(compact);
+    ASSERT_TRUE(padded);
+    ASSERT_TRUE(mixed);
+    EXPECT_EQ(*compact, expected);
+    EXPECT_EQ(*padded, expected);
+    EXPECT_EQ(*mixed, expected);
+}
+
+TEST(ParseCodeText, CByteArrayRejectsSplitPrefix) { EXPECT_FALSE(parse_code_text("{ 0 x48 }")); }
+
+TEST(ParseCodeText, EmptyByteArrayRejected) { EXPECT_FALSE(parse_code_text("{}")); }
+
+TEST(ParseCodeText, ByteArrayOverflowRejected) { EXPECT_FALSE(parse_code_text("{ 0x148 }")); }
+
+TEST(ParseCodeText, PlainHexRejectsCommas) { EXPECT_FALSE(parse_code_text("48,FF")); }
+
+TEST(ParseCodeText, WhitespaceAroundAndBetweenBytes)
+{
+    auto bytes = parse_code_text(" \t48\n FF\rC0 ");
     ASSERT_TRUE(bytes);
     ASSERT_EQ(bytes->size(), 3u);
     EXPECT_EQ((*bytes)[0], 0x48);
@@ -30,22 +59,22 @@ TEST(ParseHex, WhitespaceAroundAndBetweenBytes)
     EXPECT_EQ((*bytes)[2], 0xC0);
 }
 
-TEST(ParseHex, WhitespaceSplitsNibble) { EXPECT_FALSE(parse_hex("4 F")); }
+TEST(ParseCodeText, WhitespaceSplitsNibble) { EXPECT_FALSE(parse_code_text("4 F")); }
 
-TEST(ParseHex, DanglingNibble) { EXPECT_FALSE(parse_hex("4")); }
+TEST(ParseCodeText, DanglingNibble) { EXPECT_FALSE(parse_code_text("4")); }
 
-TEST(ParseHex, NonHex) { EXPECT_FALSE(parse_hex("zz")); }
+TEST(ParseCodeText, NonHex) { EXPECT_FALSE(parse_code_text("zz")); }
 
-TEST(ParseHex, EmptyRejected)
+TEST(ParseCodeText, EmptyRejected)
 {
-    auto bytes = parse_hex("");
+    auto bytes = parse_code_text("");
     ASSERT_FALSE(bytes);
     EXPECT_EQ(bytes.error(), "No code to run");
 }
 
-TEST(ParseHex, WhitespaceOnlyRejected)
+TEST(ParseCodeText, WhitespaceOnlyRejected)
 {
-    auto bytes = parse_hex(" \t\n");
+    auto bytes = parse_code_text(" \t\n");
     ASSERT_FALSE(bytes);
     EXPECT_EQ(bytes.error(), "No code to run");
 }
@@ -93,7 +122,7 @@ TEST(ParseDecimal, Single)
     EXPECT_TRUE(parsed->is_single);
 }
 
-TEST(ParseDecimal, LongDoubleSuffix)
+TEST(ParseDecimal, LongSuffixSelectsDoublePrecision)
 {
     auto parsed = parse_decimal_seed("1.0l", "XMM");
     ASSERT_TRUE(parsed);

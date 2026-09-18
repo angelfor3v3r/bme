@@ -18,27 +18,33 @@ decoders can disagree on the same bytes. Executing on real silicon (and swapping
 ## Features
 
 - Single-step execution with full GPR, RFLAGS, SSE (XMM), and x87 state after every completed instruction
-- Faulting instructions retain and display their exception-time partial register state without counting as executed
+- Faulting instructions retain and display their exception-time partial register state without counting as executed. Fault-time RFLAGS includes processor exception-delivery changes, such as RF being set for fault-class exceptions
 - GPR sub-register drill-down (RAX -> EAX -> AX -> AH/AL), seed any level before a run
 - x87 FPU and MXCSR shown in detail - each `ST(i)` with its physical `x87rN`, tag, 80-bit raw and value, plus decoded control/status words and MXCSR fields
 - XMM shows a decoded `f64x2` view by default, expandable to `f32x4`. x87 has a matching narrowed `Real4` view, showing what an `FSTP m32` would store
 - Intel or AT&T disassembly, switchable on the fly
-- Reports where and why a run stopped (fault, `int3`, or step cap), and marks skipped code not-reached
-- Seed status flags too - click any flag in the Flags panel (CF/PF/AF/ZF/SF/OF/DF)
+- Reports where and why a run stopped (selected row, fault, `int3`, or step cap), and marks skipped code not-reached
+- Seed status flags too - click any flag in the Flags panel (CF/PF/AF/ZF/SF/OF/DF). RF appears as read-only exception state when set on a selected fault row
 - Seed XMM and x87 `ST(i)` registers too, as raw hex or a decimal value (`1.5`, optional `f` for single precision or `l` for double precision), from the SSE / x87 panels or `--seed`
-- Scratch data buffer one guard page above a fixed reservation. The TUI shows its usable address, which RDI and RSI receive by default (toggle in Settings), or paste it into any seedable register
+- Seed MXCSR and the x87 control word as hex from the SSE / x87 panels or `--seed`
+- Scratch data buffer one guard page above a fixed reservation. The header shows the code and usable data bases. RDI and RSI receive the data base by default (toggle in Settings), or paste it into any seedable register
 - Click any register value (GPR, XMM, MXCSR, x87, or an individual float in a drill-down) to copy it to the clipboard
+- Copy the selected History row with **Copy row**, or rerun from the configured seed and stop before its address with **Run to row**
 - Keyboard shortcuts. **F5** run, **F8** step, **F7** back
 - Headless `--quick` output as a human-readable trace or versioned JSON with full machine state, CPU provenance, dependency revisions, and all decoder histories
 - Detects Intel SDE and Pin instrumentation from environment markers. Windows also checks parent processes and loaded modules. Execution is refused because instrumented single-step state cannot be trusted
-- History panel has a `Main` tab plus one tab per decoder (`zydis`, `bddisasm`, `capstone`, `xed`). Each backend applies its own instruction boundaries to the original bytes without re-running the code
+- History panel has a `Main` tab plus one tab per decoder (`zydis`, `bddisasm`, `capstone`, `xed`). Each backend applies its own instruction boundaries to the original bytes without re-running the code. Faults and stop rows are emphasized, static rows are dimmed, and code or scratch-data addresses use stable `code+offset` / `data+offset` forms by default. Settings switches to absolute addresses
 
 ## Usage
 
 BME is a terminal app - run it with no arguments to open the TUI, then edit the
-bytes, **Run** (or **F5**), and **Step** / **Back** (**F8** / **F7**) through the trace. Seed GPR, XMM, and
-x87 registers in the left panels and status flags by clicking the Flags panel. **Settings** holds the
-disasm syntax, step cap, and whether RDI/RSI point at the scratch data. **About** shows the build.
+formatted bytes, **Run** (or **F5**), and **Step** / **Back** (**F8** / **F7**) through the trace.
+Select a History row and press **Run to row** to rerun from the configured seed until RIP reaches
+that byte offset or another stop condition occurs. Seed GPR, XMM, x87, MXCSR, and x87 control-word
+state in the left panels and status flags by clicking the Flags panel. **Settings** holds the disasm
+syntax, step cap, scratch-pointer policy, and normalized-address display. **About** shows the build.
+The **Max steps** field is the TUI's instruction limit for both **Run** and **Run to row**.
+For `--quick`, use `--max-steps N`. Execution can still finish, fault, or hit `int3` before that count.
 
 The sandbox contains common faults and instruction-count runaways, but it is not a security boundary. Windows executes bytes in a host-process thread. Linux uses a traced child process. Executed bytes retain user privileges and may invoke system calls or modify process state. Run only trusted machine code. The step cap is not a wall-clock deadline, so a blocking system call can stall a run. BME refuses execution when it detects Intel SDE or Pin instrumentation.
 
@@ -50,31 +56,37 @@ Most options pre-fill TUI state. `--run`, `--quick`, `--format`, `--track`, and 
 
 ```sh
 bme --bytes 48FFC0                       # preload "inc rax", ready to run
+bme --bytes "\x48\xFF\xC0"               # C-style escaped bytes
+bme --bytes "{ 0x48, 0xFF, 0xC0 }"       # C-style byte array
+bme --file code.bin                      # load exact bytes from a raw binary file
 bme --bytes 48FFC0 --run                 # preload and run on launch
 bme --bytes 48C7C001000000 --syntax att  # preload "mov rax, 1", AT&T syntax
 bme --bytes 48FFC0 --backend bddisasm    # decode with bddisasm instead of Zydis
 bme --version                            # print build version information
 ```
 
-- `--bytes <hex>` - x86-64 machine code as hex (whitespace allowed)
-- `--run` - run immediately when `--bytes` is supplied. Otherwise open the TUI normally
+- `--bytes <text>` - formatted x86-64 machine code as contiguous or whitespace-separated hex, `\xNN` escapes, or a `{ 0xNN, ... }` byte array
+- `--file <path>` - exact bytes from a raw binary file, up to 15,000,000 bytes. Mutually exclusive with `--bytes`
+- `--run` - run immediately when `--bytes` or `--file` is supplied. Otherwise open the TUI normally
 - `--version` - print the build tag, commit hash, and repository URL
 - `--syntax intel|att` - disassembly syntax (default `intel`)
 - `--backend zydis|bddisasm|capstone|xed` - x86 decoder backend (default `zydis`, bddisasm is Intel-only)
 - `--max-steps N` - instruction cap before a run aborts (default `50000`, maximum `1000000`)
-- `--quick` - write the trace to stdout and exit instead of opening the TUI (needs `--bytes`)
+- `--quick` - write the trace to stdout and exit instead of opening the TUI (needs `--bytes` or `--file`)
 - `--format text|json` - `--quick` output format (default `text`). JSON always contains full state, so `--track` cannot be combined with `--format json`
 - `--pretty` - use two-space indentation for human-readable JSON. Requires `--quick --format json`
 - `--track <classes>` - register classes whose text `--quick` deltas include (`gpr,rip,rflags,xmm,x87` / `all` / `none`, default `gpr,rip,rflags`)
-- `--seed <name=value,...>` - initial register state. GPR slices and flags use hexadecimal; zero clears a flag and any nonzero value sets it.
+- `--seed <name=value,...>` - initial register state. GPR slices, `MXCSR`, and `control_word` use hexadecimal. Zero clears a flag and any nonzero value sets it.
   `XMM0..15` and `ST0..7` accept raw hexadecimal or a decimal containing `.` or spelled `inf`/`nan`, with `f` for single precision and `l` or no
   suffix for double precision. Any GPR slice is supported except `RSP` and its slices. Narrower GPR slices overlay wider ones
 
 ```sh
 bme --bytes 48FFC0 --quick                                   # dump "inc rax" trace to stdout
 bme --bytes 48FFC0 --quick --track all                       # track deltas from every register class
+bme --bytes EBFE --quick --max-steps 25                      # run a loop for at most 25 instructions
 bme --bytes 48F7F3 --quick --seed rax=64,rbx=9               # div rbx with seeded operands (100 / 9)
 bme --bytes D8C1 --quick --track x87 --seed st0=2.0,st1=3.0  # fadd st0, st1 -> ST0 = 5
+bme --bytes 90 --quick --seed mxcsr=5F80,control_word=27F    # seed SSE and x87 rounding controls
 bme --bytes 48FFC0 --quick --format json                     # export schema-versioned JSON to stdout
 bme --bytes 48FFC0 --quick --format json --pretty            # export indented JSON for human inspection
 ```

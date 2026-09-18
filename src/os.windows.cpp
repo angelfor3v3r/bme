@@ -40,6 +40,8 @@ struct Engine
     std::uint64_t base{};
     std::uint64_t code_length{};
     std::size_t   max_steps{};
+    std::uint64_t target_address{};
+    bool          has_target{};
 
     // Active VEH state.
     DWORD         thread_id{};
@@ -53,6 +55,7 @@ struct Engine
     DWORD                fault_code{};
     std::uint64_t        fault_address{};
     Registers            fault_registers{};
+    bool                 stopped_at_target{};
 };
 
 std::unique_ptr<Engine> g_engine{};
@@ -436,6 +439,7 @@ void Engine::snapshot_fpu(CONTEXT *context, Registers &registers) const noexcept
 
 namespace
 {
+
 LONG CALLBACK bme_veh(EXCEPTION_POINTERS *exception_pointers) noexcept
 {
     if (g_engine == nullptr || !g_engine->active || GetCurrentThreadId() != g_engine->thread_id)
@@ -455,6 +459,16 @@ LONG CALLBACK bme_veh(EXCEPTION_POINTERS *exception_pointers) noexcept
         g_engine->snapshot(context, raw_step.registers);
 
         auto code_end = code_begin + g_engine->code_length;
+        if (g_engine->has_target && next_rip == g_engine->target_address)
+        {
+            g_engine->outcome           = Outcome::Stopped;
+            g_engine->fault_address     = next_rip;
+            g_engine->stopped_at_target = true;
+            *context                    = g_engine->saved_context;
+
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
         if (next_rip < code_begin || next_rip >= code_end)
         {
             g_engine->outcome = Outcome::Finished;
@@ -489,11 +503,14 @@ LONG CALLBACK bme_veh(EXCEPTION_POINTERS *exception_pointers) noexcept
     g_engine->outcome       = Outcome::Faulted;
     g_engine->fault_code    = exc_code;
     g_engine->fault_address = (std::uint64_t)exception_pointers->ExceptionRecord->ExceptionAddress;
+
     g_engine->snapshot(context, g_engine->fault_registers);
+
     *context = g_engine->saved_context;
 
     return EXCEPTION_CONTINUE_EXECUTION;
 }
+
 } // namespace
 
 PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
@@ -508,7 +525,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     auto  code_region = request.code.size() + page_size - 1 & ~(page_size - 1);
     auto *buffer      = (std::uint8_t *)vm_alloc(code_region + page_size);
     auto *stack       = (std::uint8_t *)vm_alloc(SCRATCH_STACK_BYTES + page_size);
-    auto *data        = (std::uint8_t *)vm_alloc_at(request.scratch_reserve_base, SCRATCH_DATA_BYTES + (page_size * 2));
+    auto *data        = (std::uint8_t *)vm_alloc_at(scratch_reserve_base(), SCRATCH_DATA_BYTES + (page_size * 2));
 
     auto release_regions = [&buffer, &stack, &data, code_region, page_size]() noexcept
     {
@@ -558,11 +575,13 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     auto effective_rdi = request.seed_data_pointers && request.seed[Reg::RDI] == 0 ? data_base : request.seed[Reg::RDI];
     auto effective_rsi = request.seed_data_pointers && request.seed[Reg::RSI] == 0 ? data_base : request.seed[Reg::RSI];
 
-    g_engine               = std::make_unique<Engine>();
-    g_engine->base         = (std::uint64_t)code_base;
-    g_engine->code_length  = request.code.size();
-    g_engine->max_steps    = std::min(request.max_steps != 0 ? request.max_steps : (std::size_t)1, MAX_STEPS_LIMIT);
-    g_engine->previous_rip = g_engine->base;
+    g_engine                 = std::make_unique<Engine>();
+    g_engine->base           = (std::uint64_t)code_base;
+    g_engine->code_length    = request.code.size();
+    g_engine->max_steps      = std::min(request.max_steps != 0 ? request.max_steps : (std::size_t)1, MAX_STEPS_LIMIT);
+    g_engine->target_address = request.stop_offset ? g_engine->base + *request.stop_offset : 0;
+    g_engine->has_target     = request.stop_offset.has_value();
+    g_engine->previous_rip   = g_engine->base;
     g_engine->raw_steps.reserve(g_engine->max_steps);
 
     result.seed[Reg::RSP]    = initial_rsp;
@@ -618,11 +637,17 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     // Preserve the original startup context before applying the sandbox seed.
     g_engine->saved_context = context;
 
-    context.FltSave.ControlWord = DEFAULT_FPU_CONTROL_WORD;
+    auto mxcsr_mask = context.FltSave.MxCsr_Mask != 0 ? context.FltSave.MxCsr_Mask : MXCSR_FALLBACK_MASK;
+    if ((request.seed.mxcsr & ~mxcsr_mask) != 0)
+    {
+        return fail_thread("MXCSR seed contains bits unsupported by this CPU.");
+    }
+
+    context.FltSave.ControlWord = request.seed.fpu_control_word;
     context.FltSave.StatusWord  = 0;
     context.FltSave.TagWord     = 0;
-    context.FltSave.MxCsr       = DEFAULT_MXCSR;
-    context.MxCsr               = DEFAULT_MXCSR;
+    context.FltSave.MxCsr       = request.seed.mxcsr;
+    context.MxCsr               = request.seed.mxcsr;
 
     g_engine->snapshot_fpu(&context, result.seed);
 
@@ -672,6 +697,21 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
         return fail_thread("SetThreadContext failed.");
     }
 
+    if (request.stop_offset && *request.stop_offset == 0)
+    {
+        terminate_thread();
+
+        result.outcome           = Outcome::Stopped;
+        result.stop_address      = g_engine->base;
+        result.stopped_at_target = true;
+
+        release_regions();
+
+        g_engine = nullptr;
+
+        return result;
+    }
+
     auto *veh_handle = AddVectoredExceptionHandler(1, bme_veh);
     if (veh_handle == nullptr)
     {
@@ -718,8 +758,9 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
         step.faulted   = true;
     }
 
-    result.outcome      = g_engine->outcome;
-    result.stop_address = g_engine->fault_address;
+    result.outcome           = g_engine->outcome;
+    result.stop_address      = g_engine->fault_address;
+    result.stopped_at_target = g_engine->stopped_at_target;
 
     if (g_engine->outcome == Outcome::Faulted)
     {
