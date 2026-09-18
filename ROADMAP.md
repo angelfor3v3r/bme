@@ -1,6 +1,14 @@
 # BME Roadmap
 
-Nothing here blocks the current release. These are possible future improvements, ordered roughly by value to BME's core purpose.
+Nothing here blocks the current release. Future improvements are ordered roughly by value to BME's core purpose, with recently completed work retained for context.
+
+## Recently completed
+
+- Floating-point environment seeds for `MXCSR` and the x87 `control_word`, including host-mask validation on Windows and Linux
+- Raw binary input through `--file`, with exact byte semantics and no text-format inference
+- Formatted `--bytes` input for contiguous or whitespace-separated hex, `\xNN` escapes, and `{ 0xNN, ... }` byte arrays
+- Clear History state styling, selected-row clipboard copying, and normalized `code+offset` / `data+offset` addresses with visible absolute bases
+- **Run to row**, which reruns from the configured seed and checks the selected byte offset after every single step without patching the input
 
 ## Highest-value features
 
@@ -44,70 +52,44 @@ The Linux traced-child design already provides much of this isolation. This shou
 
 ## Smaller improvements
 
-### Seed the floating-point environment
+### Scratch stack address normalization
 
-Allow explicit seeds for:
-
-- `MXCSR`
-- x87 control word
-- Possibly x87 status and TOP where safe and meaningful
-
-Rounding mode and exception masks materially affect results. Without these seeds, users need setup instructions such as `LDMXCSR` or `FLDCW` before the instruction under investigation.
-
-### Raw-file input
-
-Add binary-file input for longer sequences and generated corpora:
+Code and scratch-data pointers now use stable `code+offset` and `data+offset` forms by default. Extend the same display to addresses within the sandbox stack:
 
 ```text
-bme --file code.bin
-```
-
-Keep `--bytes` for short interactive cases. Text formats such as C arrays and `\x48\xff` strings are lower priority.
-
-### Run to selected row
-
-Add a **Run to cursor** action that continues until:
-
-- RIP reaches the selected address
-- Execution finishes
-- A fault occurs
-- The step cap is reached
-- A wall-clock timeout is reached
-
-Check RIP after each step rather than patching the code with `int3`. Decoder boundaries may disagree, so the target should be an address or offset rather than a decoder-specific row identity.
-
-### Normalized address display
-
-Offer an offset-oriented display alongside absolute addresses:
-
-```text
-code+0000
-code+0003
-data+0010
 stack-0028
 ```
 
-Normalized offsets make traces stable across ASLR and easier to compare between platforms and runs.
+The stack anchor must remain meaningful across captured states and both platform backends.
 
-### Clearer static-history state
-
-Keep scrolling into not-reached rows, but distinguish execution and static browsing visually:
-
-- Reached rows shown normally
-- Fault rows shown in red
-- Stop rows emphasized
-- Not-reached rows dimmed
-- A `Static` or `No execution state` indicator while a not-reached row is selected
-
-This preserves useful disassembly browsing while clarifying that no register snapshot exists for the selected row.
 
 ## Larger future work
 
-### Trace import and offline inspection
+### Offline imports
 
-The versioned export schema is available. Allow BME to load an exported trace for inspection without executing its machine code. Preserve the capture CPU and platform metadata, raw execution events, outcomes, and decoder histories. Clearly distinguish the capture host from the current host.
+Treat imported artifacts as immutable capture references. Clearly distinguish the capture CPU, platform, and address space from the current host. Opening an imported artifact must never execute its machine code. Any re-execution remains a separate, explicit action.
 
-Import must not imply replay. Re-executing imported bytes on the current machine should remain a separate, explicit operation.
+#### Trace import and inspection
+
+The versioned export schema is available. Allow BME to load an exported trace for inspection while preserving its raw execution events, outcomes, decoder histories, and provenance.
+
+#### Crash-dump parsing and context extraction
+
+Add an in-tree reader for structured Windows minidumps and Linux ELF core files. Keep it limited to the records BME consumes and expose a platform-neutral data model that can be exercised headlessly. Enumerate captured threads, modules, virtual memory, and exception state. When an exception record exists, identify its faulting thread and preserve the exception code, address, and parameters as captured reference data.
+
+Extract code bytes at the captured instruction pointer and translate supported GPR, RFLAGS, XMM, x87, `MXCSR`, and x87 control-word state from register groups that the captured context marks as present. Keep unsupported state such as a captured stack pointer available for inspection even when BME cannot seed it directly.
+
+Model memory metadata and captured bytes separately. Distinguish an unmapped address, a mapped range whose bytes were not captured, and a truncated read. Never synthesize zeroes for absent dump data. Treat recognized records as optional and independent of directory order. In particular, a Windows `Memory64List` may appear without a `MemoryInfoList`, so captured ranges must be able to establish the memory map themselves. Ignore unrelated records without discarding an otherwise usable dump.
+
+Preserve module names and sparse ranges through bounded random-access reads rather than copying the entire dump into memory. Parsing must be bounds-checked, overflow-checked, resource-capped, and architecture-gated. For Linux parity, translate core-file thread and floating-point notes into the same `Registers` representation used by the existing ptrace path.
+
+#### Crash-dump navigation and replay setup
+
+Build the interactive workflow on the parsed core model rather than coupling parsing to FTXUI. Default to the faulting thread when available, but allow selecting another thread or any mapped x86-64 address. Provide an address-ordered memory map with state, type, permissions, owning module and offset, and captured-byte availability. Support executable-region filtering, address jumps, and short byte previews.
+
+Let the user explicitly load bytes at the selected virtual address into the code buffer and prefill supported seed fields from the selected thread. Reuse the scratch-memory editor to import selected data or stack ranges where they fit BME's controlled mappings. Preserve original virtual addresses for disassembly, add module-plus-offset annotations to history rows, and show the immutable captured exception and context beside any optional rerun result.
+
+Before an explicit sandbox run, report unsupported state and any relocation that prevents faithful replay. This feature must remain focused on loading a real crash into BME's decoder, seed, and sandbox pipeline rather than growing into live process attachment or a general dump viewer.
 
 ### YMM, ZMM, and opmask state
 
@@ -150,7 +132,9 @@ These currently offer little value relative to their complexity:
 
 1. Decoder divergence summary
 2. Scratch-memory inspection
-3. Windows worker process and wall-clock cancellation
-4. Floating-point environment seeds
-5. XSAVE-based modern SIMD state
-6. Dedicated fuzzer
+3. Trace import and inspection
+4. Crash-dump parsing and context extraction
+5. Crash-dump navigation and replay setup
+6. Windows worker process and wall-clock cancellation
+7. XSAVE-based modern SIMD state
+8. Dedicated fuzzer

@@ -14,23 +14,27 @@ enum class VMProtection : std::uint8_t
 constexpr std::size_t      SCRATCH_STACK_BYTES       = 0x10000;
 constexpr std::size_t      SCRATCH_DATA_BYTES        = 0x10000;
 constexpr std::uint64_t    SCRATCH_DATA_RESERVE_BASE = 0x1000'0000;
-constexpr std::uint16_t    DEFAULT_FPU_CONTROL_WORD  = 0x037F;
-constexpr std::uint32_t    DEFAULT_MXCSR             = 0x1F80;
 constexpr std::string_view INSTRUMENTATION_REFUSAL = "Running under an emulator or instrumentation layer. Native single-step tracing is unavailable.";
 
 constexpr auto          RFLAGS_STATUS_MASK    = CF | PF | AF | ZF | SF | DF | OF;
 constexpr std::uint64_t RFLAGS_TRAP_FLAG      = 0x100;
+constexpr std::uint64_t RFLAGS_RESUME_FLAG    = 0x10000;
 constexpr std::uint64_t RFLAGS_INTERRUPT_FLAG = 0x200;
 constexpr std::uint64_t RFLAGS_RESERVED_BIT1  = 0x2;
 
-void       *vm_alloc(std::size_t size) noexcept;
-void       *vm_alloc_at(std::uint64_t address, std::size_t size) noexcept;
-bool        vm_commit(void *address, std::size_t size, VMProtection protection) noexcept;
-bool        vm_protect(void *address, std::size_t size, VMProtection protection) noexcept;
-void        vm_free(void *address, std::size_t size) noexcept;
-std::size_t vm_page_size() noexcept;
-std::size_t vm_allocation_granularity() noexcept;
-bool        vm_flush_instruction_cache(const void *address, std::size_t size) noexcept;
+constexpr std::uint32_t MXCSR_DEFINED_MASK  = 0xFFFF;
+constexpr std::uint32_t MXCSR_FALLBACK_MASK = 0xFFBF;
+
+void         *vm_alloc(std::size_t size) noexcept;
+void         *vm_alloc_at(std::uint64_t address, std::size_t size) noexcept;
+bool          vm_commit(void *address, std::size_t size, VMProtection protection) noexcept;
+bool          vm_protect(void *address, std::size_t size, VMProtection protection) noexcept;
+void          vm_free(void *address, std::size_t size) noexcept;
+std::size_t   vm_page_size() noexcept;
+std::size_t   vm_allocation_granularity() noexcept;
+std::uint64_t scratch_reserve_base() noexcept;
+std::uint64_t scratch_data_base() noexcept;
+bool          vm_flush_instruction_cache(const void *address, std::size_t size) noexcept;
 
 bool        copy_to_clipboard(std::string_view text) noexcept;
 std::string environment_string(std::string_view name);
@@ -54,10 +58,10 @@ struct PlatformRunRequest
     std::span<const std::uint8_t> code{};
     Registers                     seed{};
     std::size_t                   max_steps{};
+    std::optional<std::size_t>    stop_offset{};
 
     // Scratch data setup.
-    std::uint64_t scratch_reserve_base{};
-    bool          seed_data_pointers{};
+    bool seed_data_pointers{};
 };
 
 struct PlatformRunResult
@@ -72,6 +76,7 @@ struct PlatformRunResult
     std::string   fault_name{};
     std::string   error{};
     std::uint64_t stop_address{};
+    bool          stopped_at_target{};
 };
 
 bool prepare_platform_run(const PlatformRunRequest &request, PlatformRunResult &result);

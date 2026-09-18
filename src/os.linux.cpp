@@ -197,7 +197,7 @@ void initialize_fpu() noexcept
                    "xmm14", "xmm15");
 }
 
-void child_main(const PlatformRunRequest &request, int ready_descriptor, std::size_t page_size) noexcept
+void child_main(const PlatformRunRequest &request, int ready_descriptor, std::size_t page_size, std::uint64_t data_reserve_base) noexcept
 {
     ChildReady ready{};
     if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) == -1)
@@ -211,7 +211,7 @@ void child_main(const PlatformRunRequest &request, int ready_descriptor, std::si
     auto  code_region = (request.code.size() + page_size - 1) & ~(page_size - 1);
     auto *buffer      = (std::uint8_t *)vm_alloc(code_region + page_size);
     auto *stack       = (std::uint8_t *)vm_alloc(SCRATCH_STACK_BYTES + page_size);
-    auto *data        = (std::uint8_t *)vm_alloc_at(request.scratch_reserve_base, SCRATCH_DATA_BYTES + (page_size * 2));
+    auto *data        = (std::uint8_t *)vm_alloc_at(data_reserve_base, SCRATCH_DATA_BYTES + (page_size * 2));
     if (buffer == nullptr || stack == nullptr || data == nullptr)
     {
         ready.error = ChildError::Allocation;
@@ -415,6 +415,7 @@ bool copy_to_clipboard(std::string_view text) noexcept
              : value == 62 ? '+'
                            : '/';
     };
+
     if (std::fputs("\x1b]52;c;", stdout) < 0)
     {
         return false;
@@ -423,8 +424,8 @@ bool copy_to_clipboard(std::string_view text) noexcept
     for (std::size_t offset{}; offset < text.size(); offset += 3)
     {
         auto                first  = (std::uint8_t)text[offset];
-        auto                second = offset + 1 < text.size() ? (std::uint8_t)text[offset + 1] : 0;
-        auto                third  = offset + 2 < text.size() ? (std::uint8_t)text[offset + 2] : 0;
+        std::uint8_t        second = offset + 1 < text.size() ? (std::uint8_t)text[offset + 1] : 0;
+        std::uint8_t        third  = offset + 2 < text.size() ? (std::uint8_t)text[offset + 2] : 0;
         std::array<char, 4> encoded{
             encode(first >> 2),
             encode((first & 0x3) << 4 | second >> 4),
@@ -480,9 +481,9 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     }
 
     // Query before `fork` because `sysconf` need not be async-signal-safe.
-    auto page_size = vm_page_size();
-
-    auto child = fork();
+    auto page_size         = vm_page_size();
+    auto data_reserve_base = scratch_reserve_base();
+    auto child             = fork();
     if (child == -1)
     {
         close(pipe_descriptors[0]);
@@ -497,7 +498,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     if (child == 0)
     {
         close(pipe_descriptors[0]);
-        child_main(request, pipe_descriptors[1], page_size);
+        child_main(request, pipe_descriptors[1], page_size, data_reserve_base);
     }
 
     close(pipe_descriptors[1]);
@@ -568,6 +569,15 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
         return fail("ptrace register read failed.");
     }
 
+    auto mxcsr_mask = (std::uint32_t)(fpu_registers.mxcr_mask != 0 ? fpu_registers.mxcr_mask : MXCSR_FALLBACK_MASK);
+    if ((request.seed.mxcsr & ~mxcsr_mask) != 0)
+    {
+        return fail("MXCSR seed contains bits unsupported by this CPU.");
+    }
+
+    fpu_registers.cwd   = request.seed.fpu_control_word;
+    fpu_registers.mxcsr = request.seed.mxcsr;
+
     snapshot_fpu(fpu_registers, result.seed);
 
     for (std::size_t i{}; i < result.seed.xmm.size(); ++i)
@@ -626,12 +636,24 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
         return fail("ptrace register set failed.");
     }
 
+    if (request.stop_offset && *request.stop_offset == 0)
+    {
+        result.outcome           = Outcome::Stopped;
+        result.stop_address      = ready.code_base;
+        result.stopped_at_target = true;
+
+        terminate_child(child);
+
+        return result;
+    }
+
     auto max_steps = std::min(request.max_steps != 0 ? request.max_steps : (std::size_t)1, MAX_STEPS_LIMIT);
 
     result.steps.reserve(max_steps + 1);
 
-    auto previous_rip = ready.code_base;
-    auto code_end     = ready.code_base + request.code.size();
+    auto previous_rip   = ready.code_base;
+    auto code_end       = ready.code_base + request.code.size();
+    auto target_address = request.stop_offset ? ready.code_base + *request.stop_offset : 0;
     for (;;)
     {
         if (ptrace(PTRACE_SINGLESTEP, child, nullptr, nullptr) == -1)
@@ -712,10 +734,22 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
             return result;
         }
 
-        auto  next_rip = snapshot.rip;
+        auto next_rip = snapshot.rip;
+
         auto &step     = result.steps.emplace_back();
         step.rip       = previous_rip;
         step.registers = snapshot;
+
+        if (request.stop_offset && next_rip == target_address)
+        {
+            result.outcome           = Outcome::Stopped;
+            result.stop_address      = next_rip;
+            result.stopped_at_target = true;
+
+            terminate_child(child);
+
+            return result;
+        }
 
         if (next_rip < ready.code_base || next_rip >= code_end)
         {

@@ -19,8 +19,10 @@ namespace bme
 template <class T, class E>
 using Result = std::expected<T, E>;
 
-constexpr std::size_t DEFAULT_MAX_STEPS = 50'000;    // Default single-step cap (override via `--max-steps` / Settings).
-constexpr std::size_t MAX_STEPS_LIMIT   = 1'000'000; // Hard ceiling. The trap path pre-reserves this many steps, so it bounds memory.
+constexpr std::size_t   DEFAULT_MAX_STEPS        = 50'000;    // Default single-step cap (override via `--max-steps` / Settings).
+constexpr std::size_t   MAX_STEPS_LIMIT          = 1'000'000; // Hard ceiling. The trap path pre-reserves this many steps, so it bounds memory.
+constexpr std::uint16_t DEFAULT_FPU_CONTROL_WORD = 0x037F;
+constexpr std::uint32_t DEFAULT_MXCSR            = 0x1F80;
 
 enum class Reg : std::uint8_t
 {
@@ -108,6 +110,12 @@ struct GPRSeed
     std::string byte_low{};  // Low 8 bits (`AL..`).
 };
 
+struct FloatingEnvironmentSeed
+{
+    std::string mxcsr{};
+    std::string fpu_control_word{};
+};
+
 // A decimal seed value, plus whether it carried an `f`/`F` (single-precision) suffix.
 struct DecimalSeed
 {
@@ -143,13 +151,13 @@ struct Registers
     std::uint64_t                        rflags{}; // Flags register.
 
     // SSE state.
-    std::array<std::array<std::uint64_t, 2>, 16> xmm{};   // `XMM0..XMM15` as `{lo, hi}`.
-    std::uint32_t                                mxcsr{}; // SSE control/status.
+    std::array<std::array<std::uint64_t, 2>, 16> xmm{};                 // `XMM0..XMM15` as `{lo, hi}`.
+    std::uint32_t                                mxcsr = DEFAULT_MXCSR; // SSE control/status.
 
     // x87 state.
-    std::array<std::array<std::uint8_t, 10>, 8> st{};                    // Stack-relative `ST(0)..ST(7)`, each 80-bit.
-    std::uint16_t                               fpu_control_word{};      // x87 control word.
-    std::uint16_t                               fpu_status_word{};       // x87 status word.
+    std::array<std::array<std::uint8_t, 10>, 8> st{};                                        // Stack-relative `ST(0)..ST(7)`, each 80-bit.
+    std::uint16_t                               fpu_control_word = DEFAULT_FPU_CONTROL_WORD; // x87 control word.
+    std::uint16_t                               fpu_status_word{};                           // x87 status word.
     std::uint8_t                                fpu_tag_word_abridged{}; // `FXSAVE` abridged tag (1 bit/reg), not the 16-bit x87 tag word.
 };
 
@@ -215,6 +223,7 @@ struct CLI
 
     // Invocation.
     std::optional<std::string> bytes{};
+    std::optional<std::string> input_file{};
     bool                       run{};
     bool                       quick{};
     OutputFormat               format = OutputFormat::Text;
@@ -231,30 +240,34 @@ struct CLI
     std::uint64_t                  seed_flags{};
     std::array<std::string, 16>    seed_xmm{};
     std::array<std::string, 8>     seed_st{};
+    FloatingEnvironmentSeed        seed_floating_environment{};
 };
 
-// Initialize the process-wide OS parameters the engine needs (page size, allocation granularity).
-// Call once before `run_engine`/`run_quick`/`run_tui`.
-void init();
-
-Result<std::vector<std::uint8_t>, std::string>    parse_hex(std::string_view text);
+Result<std::vector<std::uint8_t>, std::string>    parse_code_text(std::string_view text);
 Result<std::uint64_t, std::string>                parse_seed(std::string_view seed);
 Result<DecimalSeed, std::string>                  parse_decimal_seed(std::string_view text, std::string_view label);
-Result<std::array<std::uint64_t, 2>, std::string> compose_xmm_seed(const std::string &text);
-Result<std::array<std::uint8_t, 10>, std::string> compose_st_seed(const std::string &text);
+Result<std::array<std::uint64_t, 2>, std::string> compose_xmm_seed(std::string_view text);
+Result<std::array<std::uint8_t, 10>, std::string> compose_st_seed(std::string_view text);
 std::uint64_t                                     compose_gpr_seed(const GPRSeed &seed, std::string_view label, std::vector<std::string> &errors);
 Registers                                         compose_seed(
     const std::array<GPRSeed, GPR_COUNT> &seed_gpr,
     std::uint64_t                         seed_flags,
     const std::array<std::string, 16>    &seed_xmm,
     const std::array<std::string, 8>     &seed_st,
+    const FloatingEnvironmentSeed        &seed_floating_environment,
     std::vector<std::string>             &errors
 );
 
 // Process-global engine access is serialized.
 // Do not call recursively.
 Trace run_engine(
-    std::span<std::uint8_t> code, const Registers &seed, std::size_t max_steps, DisasmBackend backend, DisasmSyntax syntax, bool seed_data_pointers
+    std::span<std::uint8_t>    code,
+    const Registers           &seed,
+    std::size_t                max_steps,
+    DisasmBackend              backend,
+    DisasmSyntax               syntax,
+    bool                       seed_data_pointers,
+    std::optional<std::size_t> stop_offset = {}
 );
 
 bool                    backend_supports(DisasmBackend backend, DisasmSyntax syntax) noexcept;

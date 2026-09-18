@@ -5,6 +5,9 @@
 #include <cstdlib>
 #endif
 
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <string>
 
 TEST(RunQuick, SeededGprDelta)
@@ -16,6 +19,33 @@ TEST(RunQuick, SeededGprDelta)
     EXPECT_EQ(capture.return_code, 0);
     EXPECT_TRUE(capture.out.starts_with("CPU "));
     EXPECT_NE(capture.out.find("\nSeed\n"), std::string::npos);
+    EXPECT_NE(capture.out.find("RAX    0x0000000000000064 -> 0x0000000000000065"), std::string::npos);
+}
+
+TEST(RunQuick, RawBinaryInput)
+{
+    auto                        path = std::filesystem::temp_directory_path()
+                                     / ("bme-raw-input-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
+    std::array<std::uint8_t, 3> code{0x48, 0xFF, 0xC0};
+    {
+        std::ofstream output{path, std::ios::binary};
+        ASSERT_TRUE(output);
+
+        output.write((const char *)code.data(), (std::streamsize)code.size());
+        output.close();
+        ASSERT_TRUE(output);
+    }
+
+    auto cli = parse_cli({"--file", path.string(), "--quick", "--seed", "rax=64"});
+    ASSERT_TRUE(cli);
+
+    auto capture = run_quick_capture(*cli);
+
+    std::error_code remove_error{};
+    std::filesystem::remove(path, remove_error);
+
+    EXPECT_FALSE(remove_error);
+    EXPECT_EQ(capture.return_code, 0);
     EXPECT_NE(capture.out.find("RAX    0x0000000000000064 -> 0x0000000000000065"), std::string::npos);
 }
 
@@ -81,16 +111,6 @@ TEST(RunQuickErrors, EmptyBytes)
     EXPECT_NE(capture.err.find("No code to run"), std::string::npos);
 }
 
-TEST(RunQuickErrors, WhitespaceOnlyBytes)
-{
-    auto cli = parse_cli({"--bytes", " \t\n", "--quick"});
-    ASSERT_TRUE(cli);
-
-    auto capture = run_quick_capture(*cli);
-    EXPECT_EQ(capture.return_code, 1);
-    EXPECT_NE(capture.err.find("No code to run"), std::string::npos);
-}
-
 TEST(RunQuickErrors, BadBytes)
 {
     auto cli = parse_cli({"--bytes", "zz", "--quick"});
@@ -98,7 +118,7 @@ TEST(RunQuickErrors, BadBytes)
 
     auto capture = run_quick_capture(*cli);
     EXPECT_EQ(capture.return_code, 1);
-    EXPECT_NE(capture.err.find("Error"), std::string::npos);
+    EXPECT_NE(capture.err.find("Invalid hex byte"), std::string::npos);
 }
 
 #if BME_OS_LINUX

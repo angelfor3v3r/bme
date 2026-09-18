@@ -152,8 +152,7 @@ TEST(CPUFingerprintQuery, DecodesSyntheticAMDIdentityFeaturesAndXState)
     source.respond(CPUID_EXTENDED_FEATURES_LEAF, 0, {.eax = 0, .ebx = 0, .ecx = 1u << 2, .edx = 1u << 20});
     source.respond_with_brand("   AMD Fixture Processor");
     source.respond(CPUID_ADDRESS_WIDTH_LEAF, 0, {.eax = 48u | 57u << 8, .ebx = 0, .ecx = 0, .edx = 0});
-    source.xcr0 = 1u << 0 | 1u << 1 | 1u << 2;
-
+    source.xcr0      = 1u << 0 | 1u << 1 | 1u << 2;
     auto fingerprint = query_cpu_fingerprint(source);
     EXPECT_EQ(fingerprint.vendor, "AuthenticAMD");
     EXPECT_EQ(fingerprint.brand, "AMD Fixture Processor");
@@ -191,7 +190,6 @@ TEST(CPUFingerprintQuery, DecodesIntelIdentityAndGatesHypervisorInterface)
     source.respond_with_hypervisor(CPUID_HYPERVISOR_INTERFACE, "Microsoft Hv");
     source.respond(CPUID_HYPERVISOR_INTERFACE, 0, {.eax = text_word("Hv#1", 0), .ebx = 0, .ecx = 0, .edx = 0});
     source.respond(CPUID_EXTENDED_LIMIT_LEAF, 0, {});
-
     auto fingerprint = query_cpu_fingerprint(source);
     EXPECT_EQ(fingerprint.vendor, "GenuineIntel");
     ASSERT_TRUE(fingerprint.family);
@@ -249,7 +247,6 @@ TEST(CPUFingerprintQuery, RequiresXsaveForStateLeavesAndOSXSaveForXgetbv)
     source.respond(CPUID_XSTATE_LEAF, 0, {.eax = 0x3u, .ebx = 0, .ecx = 0, .edx = 0});
     source.respond(CPUID_XSTATE_LEAF, 1, {});
     source.respond(CPUID_EXTENDED_LIMIT_LEAF, 0, {});
-
     auto fingerprint = query_cpu_fingerprint(source);
     EXPECT_TRUE(fingerprint.xcr0_supported);
     EXPECT_TRUE(fingerprint.xss_supported);
@@ -275,7 +272,6 @@ TEST(CPUFingerprintQuery, CapsStructuredFeatureSubleafEnumeration)
     source.respond(CPUID_SIGNATURE_LEAF, 0, {});
     source.respond(CPUID_STRUCTURED_FEATURES_LEAF, 0, {.eax = std::numeric_limits<std::uint32_t>::max(), .ebx = 0, .ecx = 0, .edx = 0});
     source.respond(CPUID_EXTENDED_LIMIT_LEAF, 0, {});
-
     auto fingerprint = query_cpu_fingerprint(source);
     auto structured_queries =
         std::ranges::count_if(source.queries, [](const CPUIDQuery &query) { return query.first == CPUID_STRUCTURED_FEATURES_LEAF; });
@@ -295,7 +291,6 @@ TEST(CPUFingerprintFormat, IncludesAvailableIdentityAndXcr0)
     fingerprint.model    = 0x44u;
     fingerprint.stepping = 0x0u;
     fingerprint.xcr0     = 0x602E7u;
-
     EXPECT_EQ(format_cpu_summary(fingerprint), "AMD Fixture Processor (AuthenticAMD family 0x1A model 0x44 stepping 0x0, XCR0 0x00000000000602E7)");
 }
 
@@ -304,7 +299,6 @@ TEST(CPUFingerprintFormat, FallsBackToVendorAndOmitsUnavailableFields)
     CPUFingerprint fingerprint{};
     fingerprint.vendor = "MinimalCPU";
     fingerprint.family = 0x6u;
-
     EXPECT_EQ(format_cpu_summary(fingerprint), "MinimalCPU family 0x6");
 
     fingerprint.family.reset();

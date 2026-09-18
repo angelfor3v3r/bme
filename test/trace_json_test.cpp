@@ -1,13 +1,12 @@
 #include "bme_core.hpp"
 #include "bme_version.hpp"
 
+#include <glaze/json/generic.hpp>
+#include <glaze/json/read.hpp>
 #include <gtest/gtest.h>
 
 #include <array>
-#include <charconv>
-#include <cstddef>
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -16,382 +15,36 @@
 #include <streambuf>
 #include <string>
 #include <string_view>
-#include <variant>
-#include <vector>
+#include <utility>
 
 using namespace bme;
 
 namespace
 {
 
-struct JsonValue
+using JsonValue = glz::generic_sorted_u64;
+
+auto parse_json(std::string_view json)
 {
-    using Array  = std::vector<JsonValue>;
-    using Object = std::map<std::string, JsonValue, std::less<>>;
-    using Value  = std::variant<std::nullptr_t, bool, std::uint64_t, std::string, Array, Object>;
+    auto result = glz::read_json<JsonValue>(json);
+    if (!result)
+    {
+        throw std::runtime_error(glz::format_error(result.error(), json));
+    }
 
-    bool        is_null() const noexcept { return std::holds_alternative<std::nullptr_t>(value); }
-    bool        boolean() const { return std::get<bool>(value); }
-    auto        number() const { return std::get<std::uint64_t>(value); }
-    const auto &string() const { return std::get<std::string>(value); }
-    const auto &array() const { return std::get<Array>(value); }
-    const auto &object() const { return std::get<Object>(value); }
-    const auto &at(std::string_view key) const { return object().at(std::string{key}); }
+    return std::move(*result);
+}
 
-    Value value{};
-};
-
-class JsonParser
+auto dump_json(const JsonValue &value)
 {
-public:
-    explicit JsonParser(std::string_view input) : m_input(input) {}
-
-    JsonValue parse()
+    auto result = value.dump();
+    if (!result)
     {
-        skip_whitespace();
-
-        auto result = parse_value();
-
-        skip_whitespace();
-
-        if (m_position != m_input.size())
-        {
-            fail("Trailing JSON data");
-        }
-
-        return result;
+        throw std::runtime_error(glz::format_error(result.error()));
     }
 
-private:
-    [[noreturn]] void fail(std::string_view message) const
-    {
-        throw std::runtime_error(std::string{message} + " at byte " + std::to_string(m_position));
-    }
-
-    bool consume(char expected) noexcept
-    {
-        if (m_position == m_input.size() || m_input[m_position] != expected)
-        {
-            return false;
-        }
-
-        ++m_position;
-
-        return true;
-    }
-
-    void expect(char expected)
-    {
-        if (consume(expected))
-        {
-            return;
-        }
-
-        fail("Unexpected JSON token");
-    }
-
-    void expect(std::string_view expected)
-    {
-        if (!m_input.substr(m_position).starts_with(expected))
-        {
-            fail("Unexpected JSON literal");
-        }
-
-        m_position += expected.size();
-    }
-
-    void skip_whitespace() noexcept
-    {
-        while (m_position < m_input.size())
-        {
-            auto character = m_input[m_position];
-            if (character != ' ' && character != '\t' && character != '\r' && character != '\n')
-            {
-                break;
-            }
-
-            ++m_position;
-        }
-    }
-
-    JsonValue parse_value()
-    {
-        if (m_position == m_input.size())
-        {
-            fail("Unexpected end of JSON");
-        }
-
-        switch (m_input[m_position])
-        {
-        case 'n': expect("null"); return JsonValue{.value = nullptr};
-        case 't': expect("true"); return JsonValue{.value = true};
-        case 'f': expect("false"); return JsonValue{.value = false};
-        case '"': return JsonValue{.value = parse_string()};
-        case '[': return JsonValue{.value = parse_array()};
-        case '{': return JsonValue{.value = parse_object()};
-        default:  return JsonValue{.value = parse_number()};
-        }
-    }
-
-    std::uint32_t parse_hex_quad()
-    {
-        if (m_input.size() - m_position < 4)
-        {
-            fail("Incomplete JSON Unicode escape");
-        }
-
-        std::uint32_t result{};
-        for (std::size_t i{}; i < 4; ++i)
-        {
-            auto character = m_input[m_position++];
-
-            result <<= 4;
-
-            if (character >= '0' && character <= '9')
-            {
-                result |= (std::uint32_t)(character - '0');
-            }
-            else if (character >= 'A' && character <= 'F')
-            {
-                result |= (std::uint32_t)(character - 'A' + 10);
-            }
-            else if (character >= 'a' && character <= 'f')
-            {
-                result |= (std::uint32_t)(character - 'a' + 10);
-            }
-            else
-            {
-                fail("Invalid JSON Unicode escape");
-            }
-        }
-
-        return result;
-    }
-
-    void append_utf8(std::string &output, std::uint32_t code_point)
-    {
-        if (code_point <= 0x7F)
-        {
-            output += (char)code_point;
-        }
-        else if (code_point <= 0x7FF)
-        {
-            output += (char)(0xC0 | code_point >> 6);
-            output += (char)(0x80 | (code_point & 0x3F));
-        }
-        else if (code_point <= 0xFFFF)
-        {
-            output += (char)(0xE0 | code_point >> 12);
-            output += (char)(0x80 | (code_point >> 6 & 0x3F));
-            output += (char)(0x80 | (code_point & 0x3F));
-        }
-        else if (code_point <= 0x10FFFF)
-        {
-            output += (char)(0xF0 | code_point >> 18);
-            output += (char)(0x80 | (code_point >> 12 & 0x3F));
-            output += (char)(0x80 | (code_point >> 6 & 0x3F));
-            output += (char)(0x80 | (code_point & 0x3F));
-        }
-        else
-        {
-            fail("Invalid JSON Unicode code point");
-        }
-    }
-
-    std::string parse_string()
-    {
-        expect('"');
-
-        std::string result{};
-        while (m_position < m_input.size())
-        {
-            auto character = m_input[m_position++];
-            if (character == '"')
-            {
-                return result;
-            }
-
-            if ((std::uint8_t)character < 0x20)
-            {
-                fail("Unescaped JSON control character");
-            }
-
-            if (character != '\\')
-            {
-                result += character;
-
-                continue;
-            }
-
-            if (m_position == m_input.size())
-            {
-                fail("Incomplete JSON escape");
-            }
-
-            auto escape = m_input[m_position++];
-            switch (escape)
-            {
-            case '"':  result += '"'; break;
-            case '\\': result += '\\'; break;
-            case '/':  result += '/'; break;
-            case 'b':  result += '\b'; break;
-            case 'f':  result += '\f'; break;
-            case 'n':  result += '\n'; break;
-            case 'r':  result += '\r'; break;
-            case 't':  result += '\t'; break;
-            case 'u':
-            {
-                auto code_point = parse_hex_quad();
-                if (code_point >= 0xD800 && code_point <= 0xDBFF)
-                {
-                    if (!consume('\\') || !consume('u'))
-                    {
-                        fail("Incomplete JSON surrogate pair");
-                    }
-
-                    auto low_surrogate = parse_hex_quad();
-                    if (low_surrogate < 0xDC00 || low_surrogate > 0xDFFF)
-                    {
-                        fail("Invalid JSON surrogate pair");
-                    }
-
-                    code_point = 0x10000 + ((code_point - 0xD800) << 10) + low_surrogate - 0xDC00;
-                }
-                else if (code_point >= 0xDC00 && code_point <= 0xDFFF)
-                {
-                    fail("Unexpected JSON low surrogate");
-                }
-
-                append_utf8(result, code_point);
-
-                break;
-            }
-            default: fail("Invalid JSON escape");
-            }
-        }
-
-        fail("Unterminated JSON string");
-    }
-
-    std::uint64_t parse_number()
-    {
-        auto start = m_position;
-        if (consume('-'))
-        {
-            fail("Negative JSON number not supported by trace schema");
-        }
-
-        if (consume('0'))
-        {
-            if (m_position < m_input.size() && m_input[m_position] >= '0' && m_input[m_position] <= '9')
-            {
-                fail("Leading zero in JSON number");
-            }
-        }
-        else
-        {
-            auto first_digit = m_position;
-
-            while (m_position < m_input.size() && m_input[m_position] >= '0' && m_input[m_position] <= '9')
-            {
-                ++m_position;
-            }
-
-            if (first_digit == m_position)
-            {
-                fail("Invalid JSON number");
-            }
-        }
-
-        if (m_position < m_input.size() && (m_input[m_position] == '.' || m_input[m_position] == 'e' || m_input[m_position] == 'E'))
-        {
-            fail("Fractional JSON number not supported by trace schema");
-        }
-
-        std::uint64_t result{};
-        auto [end, error] = std::from_chars(m_input.data() + start, m_input.data() + m_position, result);
-        if (error != std::errc{} || end != m_input.data() + m_position)
-        {
-            fail("Invalid JSON integer");
-        }
-
-        return result;
-    }
-
-    JsonValue::Array parse_array()
-    {
-        expect('[');
-        skip_whitespace();
-
-        if (consume(']'))
-        {
-            return {};
-        }
-
-        JsonValue::Array result{};
-        while (true)
-        {
-            skip_whitespace();
-
-            result.emplace_back(parse_value());
-
-            skip_whitespace();
-
-            if (consume(']'))
-            {
-                return result;
-            }
-
-            expect(',');
-        }
-    }
-
-    JsonValue::Object parse_object()
-    {
-        expect('{');
-        skip_whitespace();
-
-        if (consume('}'))
-        {
-            return {};
-        }
-
-        JsonValue::Object result{};
-        while (true)
-        {
-            skip_whitespace();
-
-            if (m_position == m_input.size() || m_input[m_position] != '"')
-            {
-                fail("JSON object key is not a string");
-            }
-
-            auto key = parse_string();
-
-            skip_whitespace();
-            expect(':');
-            skip_whitespace();
-
-            auto inserted = result.emplace(std::move(key), parse_value()).second;
-            if (!inserted)
-            {
-                fail("Duplicate JSON object key");
-            }
-
-            skip_whitespace();
-
-            if (consume('}'))
-            {
-                return result;
-            }
-
-            expect(',');
-        }
-    }
-
-    std::string_view m_input{};
-    std::size_t      m_position{};
-};
+    return std::move(*result);
+}
 
 class FailingStreamBuffer final : public std::streambuf
 {
@@ -442,16 +95,19 @@ std::shared_ptr<const CPUFingerprint> make_cpu_fingerprint()
     return result;
 }
 
-Registers make_registers()
+auto make_registers()
 {
     Registers result{};
     result[Reg::RAX]             = 0x0123'4567'89AB'CDEF;
     result[Reg::RBX]             = 0xFEDC'BA98'7654'3210;
+    result[Reg::R15]             = 0x0F0E'0D0C'0B0A'0908;
     result[Reg::RIP]             = 0x0000'0000'0000'1000;
     result[Reg::RFLAGS]          = 0x0000'0000'0000'0246;
     result.xmm[0]                = {0x0011'2233'4455'6677, 0x8899'AABB'CCDD'EEFF};
+    result.xmm[15]               = {0x1020'3040'5060'7080, 0x90A0'B0C0'D0E0'F000};
     result.mxcsr                 = 0xA1B2'C3D4;
     result.st[0]                 = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99};
+    result.st[7]                 = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0};
     result.fpu_control_word      = 0x1234;
     result.fpu_status_word       = 0x5678;
     result.fpu_tag_word_abridged = 0x9A;
@@ -459,7 +115,7 @@ Registers make_registers()
     return result;
 }
 
-Trace make_trace()
+auto make_trace()
 {
     Trace result{};
     result.cpu_fingerprint     = make_cpu_fingerprint();
@@ -503,10 +159,10 @@ Trace make_trace()
     return result;
 }
 
-std::string serialize(const Trace &trace)
+auto serialize(const Trace &trace, bool pretty = false)
 {
     std::ostringstream output{};
-    auto               result = write_trace_json(trace, output);
+    auto               result = write_trace_json(trace, output, pretty);
     if (!result)
     {
         throw std::runtime_error(result.error());
@@ -530,11 +186,11 @@ constexpr std::array EXPECTED_DEPENDENCIES{
     ExpectedDependency{.name = "glaze", .version = BME_GLAZE_VERSION, .revision = BME_GLAZE_REVISION},
 };
 
-const JsonValue &dependency(const JsonValue::Array &dependencies, std::string_view name)
+const auto &dependency(const JsonValue::array_t &dependencies, std::string_view name)
 {
     for (auto &&entry : dependencies)
     {
-        if (entry.at("name").string() == name)
+        if (entry.at("name").get_string() == name)
         {
             return entry;
         }
@@ -550,106 +206,206 @@ TEST(TraceJson, EmitsVersionedPortableDocument)
     EXPECT_EQ(json.back(), '\n');
     EXPECT_EQ(json.find('\n'), json.size() - 1);
 
-    auto document = JsonParser{json}.parse();
-    ASSERT_EQ(document.object().size(), 6u);
-    EXPECT_EQ(document.at("schema_version").number(), 1u);
+    auto document = parse_json(json);
+    ASSERT_EQ(document.get_object().size(), 6u);
+    EXPECT_EQ(document.at("schema_version").get<std::uint64_t>(), 1u);
 
     auto &producer = document.at("producer");
-    EXPECT_EQ(producer.at("name").string(), "bme");
-    EXPECT_EQ(producer.at("repository").string(), "https://github.com/angelfor3v3r/bme");
+    EXPECT_EQ(producer.at("name").get_string(), "bme");
+    EXPECT_EQ(producer.at("version").get_string(), BME_GIT_TAG);
+    EXPECT_EQ(producer.at("git_hash").get_string(), BME_GIT_HASH);
+    EXPECT_EQ(producer.at("repository").get_string(), BME_GIT_URL);
 
-    auto &dependencies = producer.at("dependencies").array();
+    auto &dependencies = producer.at("dependencies").get_array();
     ASSERT_EQ(dependencies.size(), EXPECTED_DEPENDENCIES.size());
+
     for (auto &&expected : EXPECTED_DEPENDENCIES)
     {
         auto &actual = dependency(dependencies, expected.name);
-        EXPECT_EQ(actual.at("version").string(), expected.version);
-        EXPECT_EQ(actual.at("revision").string(), expected.revision);
+        EXPECT_EQ(actual.at("version").get_string(), expected.version);
+        EXPECT_EQ(actual.at("revision").get_string(), expected.revision);
     }
 
     auto &host = document.at("host");
 
 #if BME_OS_WINDOWS
-    EXPECT_EQ(host.at("os").string(), "windows");
+    EXPECT_EQ(host.at("os").get_string(), "windows");
 #elif BME_OS_LINUX
-    EXPECT_EQ(host.at("os").string(), "linux");
+    EXPECT_EQ(host.at("os").get_string(), "linux");
 #endif
 
-    EXPECT_EQ(host.at("architecture").string(), "x86_64");
+    EXPECT_EQ(host.at("architecture").get_string(), "x86_64");
 
     auto &cpu = host.at("cpu");
-    EXPECT_EQ(cpu.at("capture_scope").string(), "host_visible_process");
-    EXPECT_FALSE(cpu.at("execution_cpu_attributed").boolean());
-    EXPECT_EQ(cpu.at("vendor").string(), "AuthenticAMD");
-    EXPECT_EQ(cpu.at("maximum_extended_leaf").string(), "0x80000008");
+    EXPECT_EQ(cpu.at("capture_scope").get_string(), "host_visible_process");
+    EXPECT_FALSE(cpu.at("execution_cpu_attributed").get_boolean());
+    EXPECT_EQ(cpu.at("vendor").get_string(), "AuthenticAMD");
+    EXPECT_EQ(cpu.at("brand").get_string(), "Synthetic CPU");
+    EXPECT_EQ(cpu.at("family").get<std::uint64_t>(), 0x1Au);
+    EXPECT_EQ(cpu.at("model").get<std::uint64_t>(), 0x44u);
+    EXPECT_EQ(cpu.at("stepping").get<std::uint64_t>(), 0u);
+    EXPECT_EQ(cpu.at("maximum_basic_leaf").get_string(), "0x0000000D");
+    EXPECT_EQ(cpu.at("maximum_extended_leaf").get_string(), "0x80000008");
+    EXPECT_EQ(cpu.at("physical_address_width").get<std::uint64_t>(), 52u);
+    EXPECT_EQ(cpu.at("linear_address_width").get<std::uint64_t>(), 57u);
+    EXPECT_TRUE(cpu.at("hypervisor_present").get_boolean());
+    EXPECT_EQ(cpu.at("hypervisor_vendor").get_string(), "TestVendor");
+    EXPECT_EQ(cpu.at("hypervisor_interface").get_string(), "Hv#1");
+    EXPECT_EQ(cpu.at("xcr0_supported").get_string(), "0x00000000000000E7");
     EXPECT_TRUE(cpu.at("xss_supported").is_null());
-    EXPECT_EQ(cpu.at("xcr0").string(), "0x0000000000000007");
+    EXPECT_EQ(cpu.at("xcr0").get_string(), "0x0000000000000007");
 
-    auto &raw_cpuid = cpu.at("raw_cpuid").array();
+    auto &cpuid_features = cpu.at("cpuid_features").get_array();
+    ASSERT_EQ(cpuid_features.size(), 2u);
+    EXPECT_EQ(cpuid_features[0].get_string(), "SSE2");
+    EXPECT_EQ(cpuid_features[1].get_string(), "AVX");
+
+    auto &enabled_xstate = cpu.at("enabled_xstate").get_array();
+    ASSERT_EQ(enabled_xstate.size(), 3u);
+    EXPECT_EQ(enabled_xstate[0].get_string(), "x87");
+    EXPECT_EQ(enabled_xstate[1].get_string(), "SSE");
+    EXPECT_EQ(enabled_xstate[2].get_string(), "AVX");
+
+    auto &raw_cpuid = cpu.at("raw_cpuid").get_array();
     ASSERT_EQ(raw_cpuid.size(), 1u);
-    EXPECT_EQ(raw_cpuid[0].at("eax").string(), "0x00A40F00");
-    EXPECT_EQ(raw_cpuid[0].at("edx").string(), "0x99AABBCC");
+    EXPECT_EQ(raw_cpuid[0].at("leaf").get_string(), "0x00000001");
+    EXPECT_EQ(raw_cpuid[0].at("subleaf").get_string(), "0x00000000");
+    EXPECT_EQ(raw_cpuid[0].at("eax").get_string(), "0x00A40F00");
+    EXPECT_EQ(raw_cpuid[0].at("ebx").get_string(), "0x11223344");
+    EXPECT_EQ(raw_cpuid[0].at("ecx").get_string(), "0x55667788");
+    EXPECT_EQ(raw_cpuid[0].at("edx").get_string(), "0x99AABBCC");
 
     auto &request = document.at("request");
-    EXPECT_EQ(request.at("input_bytes").string(), "90");
-    EXPECT_EQ(request.at("backend").string(), "xed");
-    EXPECT_EQ(request.at("syntax").string(), "att");
-    EXPECT_EQ(request.at("effective_max_steps").number(), 123u);
-    EXPECT_FALSE(request.at("seed_data_pointers").boolean());
+    EXPECT_EQ(request.at("input_bytes").get_string(), "90");
+    EXPECT_EQ(request.at("backend").get_string(), "xed");
+    EXPECT_EQ(request.at("syntax").get_string(), "att");
+    EXPECT_EQ(request.at("effective_max_steps").get<std::uint64_t>(), 123u);
+    EXPECT_FALSE(request.at("seed_data_pointers").get_boolean());
 
     auto &requested_seed = request.at("seed");
-    EXPECT_EQ(requested_seed.at("gpr").at("rax").string(), "0x0123456789ABCDEF");
-    EXPECT_EQ(requested_seed.at("gpr").at("rflags").string(), "0x0000000000000246");
-    EXPECT_EQ(requested_seed.at("sse").at("xmm0").string(), "0x8899AABBCCDDEEFF0011223344556677");
-    EXPECT_EQ(requested_seed.at("sse").at("mxcsr").string(), "0xA1B2C3D4");
-    EXPECT_EQ(requested_seed.at("x87").at("st0").string(), "0x99887766554433221100");
-    EXPECT_EQ(requested_seed.at("x87").at("control_word").string(), "0x1234");
-    EXPECT_EQ(requested_seed.at("x87").at("status_word").string(), "0x5678");
-    EXPECT_EQ(requested_seed.at("x87").at("tag_word_abridged").string(), "0x9A");
+    ASSERT_EQ(requested_seed.at("gpr").get_object().size(), 18u);
+    ASSERT_EQ(requested_seed.at("sse").get_object().size(), 17u);
+    ASSERT_EQ(requested_seed.at("x87").get_object().size(), 11u);
+    EXPECT_EQ(requested_seed.at("gpr").at("rax").get_string(), "0x0123456789ABCDEF");
+    EXPECT_EQ(requested_seed.at("gpr").at("rbx").get_string(), "0xFEDCBA9876543210");
+    EXPECT_EQ(requested_seed.at("gpr").at("r15").get_string(), "0x0F0E0D0C0B0A0908");
+    EXPECT_EQ(requested_seed.at("gpr").at("rflags").get_string(), "0x0000000000000246");
+    EXPECT_EQ(requested_seed.at("sse").at("xmm0").get_string(), "0x8899AABBCCDDEEFF0011223344556677");
+    EXPECT_EQ(requested_seed.at("sse").at("xmm15").get_string(), "0x90A0B0C0D0E0F0001020304050607080");
+    EXPECT_EQ(requested_seed.at("sse").at("mxcsr").get_string(), "0xA1B2C3D4");
+    EXPECT_EQ(requested_seed.at("x87").at("st0").get_string(), "0x99887766554433221100");
+    EXPECT_EQ(requested_seed.at("x87").at("st7").get_string(), "0xA0908070605040302010");
+    EXPECT_EQ(requested_seed.at("x87").at("control_word").get_string(), "0x1234");
+    EXPECT_EQ(requested_seed.at("x87").at("status_word").get_string(), "0x5678");
+    EXPECT_EQ(requested_seed.at("x87").at("tag_word_abridged").get_string(), "0x9A");
 
     auto &execution = document.at("execution");
-    EXPECT_EQ(execution.at("outcome").string(), "faulted");
-    EXPECT_EQ(execution.at("message").string(), "Synthetic \"fault\"\nmessage");
-    EXPECT_EQ(execution.at("stop_address").string(), "0x0000000000002000");
-    EXPECT_EQ(execution.at("seed").at("gpr").at("rax").string(), "0x1111111111111111");
+    EXPECT_FALSE(execution.at("instrumentation_detected").get_boolean());
+    EXPECT_EQ(execution.at("outcome").get_string(), "faulted");
+    EXPECT_EQ(execution.at("message").get_string(), "Synthetic \"fault\"\nmessage");
+    EXPECT_EQ(execution.at("stop_reason").get_string(), "Synthetic fault");
+    EXPECT_EQ(execution.at("stop_address").get_string(), "0x0000000000002000");
+    EXPECT_EQ(execution.at("seed").at("gpr").at("rax").get_string(), "0x1111111111111111");
 
-    auto &events = execution.at("events").array();
+    auto &events = execution.at("events").get_array();
     ASSERT_EQ(events.size(), 2u);
-    EXPECT_EQ(events[0].at("index").number(), 0u);
-    EXPECT_EQ(events[0].at("classification").string(), "completed");
-    EXPECT_EQ(events[0].at("offset").number(), 0u);
-    EXPECT_EQ(events[0].at("registers").at("gpr").at("rax").string(), "0x2222222222222222");
-    EXPECT_EQ(events[1].at("classification").string(), "faulted");
+    EXPECT_EQ(events[0].at("index").get<std::uint64_t>(), 0u);
+    EXPECT_EQ(events[0].at("rip").get_string(), "0x0000000000001000");
+    EXPECT_EQ(events[0].at("classification").get_string(), "completed");
+    EXPECT_EQ(events[0].at("offset").get<std::uint64_t>(), 0u);
+    EXPECT_EQ(events[0].at("registers").at("gpr").at("rax").get_string(), "0x2222222222222222");
+    EXPECT_EQ(events[1].at("index").get<std::uint64_t>(), 1u);
+    EXPECT_EQ(events[1].at("classification").get_string(), "faulted");
+    EXPECT_EQ(events[1].at("rip").get_string(), "0x0000000000002000");
     EXPECT_TRUE(events[1].at("offset").is_null());
-    EXPECT_EQ(events[1].at("registers").at("gpr").at("rax").string(), "0x3333333333333333");
-    EXPECT_EQ(events[1].at("registers").at("gpr").at("rip").string(), "0x0000000000002000");
+    EXPECT_EQ(events[1].at("registers").at("gpr").at("rax").get_string(), "0x3333333333333333");
+    EXPECT_EQ(events[1].at("registers").at("gpr").at("rip").get_string(), "0x0000000000002000");
 
-    auto &decoders = document.at("decoders").array();
+    auto &decoders = document.at("decoders").get_array();
     ASSERT_EQ(decoders.size(), 4u);
-    EXPECT_EQ(decoders[0].at("backend").string(), "zydis");
-    EXPECT_EQ(decoders[1].at("backend").string(), "bddisasm");
-    EXPECT_EQ(decoders[2].at("backend").string(), "capstone");
-    EXPECT_EQ(decoders[3].at("backend").string(), "xed");
+    EXPECT_EQ(decoders[0].at("backend").get_string(), "zydis");
+    EXPECT_EQ(decoders[1].at("backend").get_string(), "bddisasm");
+    EXPECT_EQ(decoders[2].at("backend").get_string(), "capstone");
+    EXPECT_EQ(decoders[3].at("backend").get_string(), "xed");
 
     for (auto &&decoder : decoders)
     {
-        EXPECT_EQ(decoder.at("requested_syntax").string(), "att");
-        EXPECT_NE(decoder.at("version").string(), "unknown");
-        EXPECT_EQ(decoder.at("revision").string().size(), 40u);
+        EXPECT_EQ(decoder.at("requested_syntax").get_string(), "att");
 
-        auto &rows = decoder.at("rows").array();
-        ASSERT_FALSE(rows.empty());
+        auto &metadata = dependency(dependencies, decoder.at("backend").get_string());
+        EXPECT_EQ(decoder.at("version").get_string(), metadata.at("version").get_string());
+        EXPECT_EQ(decoder.at("revision").get_string(), metadata.at("revision").get_string());
+
+        auto &rows = decoder.at("rows").get_array();
+        ASSERT_EQ(rows.size(), 1u);
 
         auto &row = rows.front();
-        EXPECT_EQ(row.object().size(), 7u);
-        EXPECT_FALSE(row.at("address").string().empty());
-        EXPECT_GT(row.at("length").number(), 0u);
+        EXPECT_EQ(row.get_object().size(), 7u);
+        EXPECT_EQ(row.at("address").get_string(), "0x0000000000001000");
+        EXPECT_EQ(row.at("offset").get<std::uint64_t>(), 0u);
+        EXPECT_EQ(row.at("length").get<std::uint64_t>(), 1u);
+        EXPECT_EQ(row.at("bytes").get_string(), "90");
+        EXPECT_EQ(row.at("classification").get_string(), "reached");
+        EXPECT_EQ(row.at("execution_event").get<std::uint64_t>(), 0u);
     }
 
-    EXPECT_EQ(decoders[0].at("effective_syntax").string(), "att");
-    EXPECT_EQ(decoders[1].at("effective_syntax").string(), "intel");
-    EXPECT_EQ(decoders[2].at("effective_syntax").string(), "att");
-    EXPECT_EQ(decoders[3].at("effective_syntax").string(), "att");
+    EXPECT_EQ(decoders[0].at("effective_syntax").get_string(), "att");
+    EXPECT_EQ(decoders[1].at("effective_syntax").get_string(), "intel");
+    EXPECT_EQ(decoders[2].at("effective_syntax").get_string(), "att");
+    EXPECT_EQ(decoders[3].at("effective_syntax").get_string(), "att");
+}
+
+TEST(TraceJson, SerializesInRangeFaultHistory)
+{
+    auto trace = make_trace();
+
+    trace.execution_events.clear();
+
+    trace.execution_events.emplace_back(
+        ExecutionEvent{
+            .rip       = trace.seed[Reg::RIP],
+            .registers = make_registers(),
+            .kind      = ExecutionEventKind::Faulted,
+        }
+    );
+
+    trace.stop_address = trace.seed[Reg::RIP];
+
+    auto  document  = parse_json(serialize(trace));
+    auto &execution = document.at("execution");
+    EXPECT_EQ(execution.at("stop_address").get_string(), "0x0000000000001000");
+
+    auto &events = execution.at("events").get_array();
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].at("classification").get_string(), "faulted");
+    EXPECT_EQ(events[0].at("offset").get<std::uint64_t>(), 0u);
+
+    for (auto &&decoder : document.at("decoders").get_array())
+    {
+        auto &rows = decoder.at("rows").get_array();
+        ASSERT_EQ(rows.size(), 1u);
+
+        auto &row = rows.front();
+        EXPECT_EQ(row.at("address").get_string(), "0x0000000000001000");
+        EXPECT_EQ(row.at("offset").get<std::uint64_t>(), 0u);
+        EXPECT_EQ(row.at("length").get<std::uint64_t>(), 1u);
+        EXPECT_EQ(row.at("bytes").get_string(), "90");
+        EXPECT_EQ(row.at("classification").get_string(), "faulted");
+        EXPECT_EQ(row.at("execution_event").get<std::uint64_t>(), 0u);
+    }
+}
+
+TEST(TraceJson, PrettyDocumentMatchesCompactDocument)
+{
+    auto  trace       = make_trace();
+    auto  compact     = parse_json(serialize(trace));
+    auto  pretty_json = serialize(trace, true);
+    auto  pretty      = parse_json(pretty_json);
+    auto &pretty_cpu  = pretty.at("host").at("cpu");
+    EXPECT_TRUE(pretty_json.starts_with("{\n  \"schema_version\": 1,"));
+    EXPECT_TRUE(pretty_cpu.contains("xss_supported"));
+    EXPECT_TRUE(pretty_cpu.at("xss_supported").is_null());
+    EXPECT_EQ(dump_json(pretty), dump_json(compact));
 }
 
 TEST(TraceJson, RejectsMissingFingerprint)
@@ -681,4 +437,5 @@ TEST(TraceJson, ReportsFlushFailure)
     ASSERT_FALSE(result);
     EXPECT_NE(result.error().find("stream write failed"), std::string::npos);
 }
+
 } // namespace

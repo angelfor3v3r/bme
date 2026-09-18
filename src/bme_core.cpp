@@ -1,7 +1,5 @@
 #include "bme_core.hpp"
 #include "common.hpp"
-#include "os.hpp"
-#include "util.hpp"
 
 // Version metadata.
 // CMake generates `bme_version.hpp` each build, falling back to placeholders outside CMake.
@@ -12,6 +10,9 @@
 #define BME_GIT_HASH "unknown"
 #define BME_GIT_URL  "https://github.com/angelfor3v3r/bme"
 #endif
+
+#include "os.hpp"
+#include "util.hpp"
 
 #include <argparse/argparse.hpp>
 #include <bddisasm.h>
@@ -40,6 +41,7 @@ extern "C"
 #include <cstdio>
 #include <cstring>
 #include <expected>
+#include <fstream>
 #include <functional>
 #include <initializer_list>
 #include <iostream>
@@ -206,15 +208,9 @@ const auto &backend_info(DisasmBackend backend) noexcept { return BACKENDS[(std:
 // argparse validates the token first, so the Zydis fallback is just a safety net.
 auto backend_from_cli(std::string_view name) noexcept
 {
-    for (std::size_t i{}; i < BACKENDS.size(); ++i)
-    {
-        if (BACKENDS[i].cli == name)
-        {
-            return (DisasmBackend)i;
-        }
-    }
+    auto found = std::ranges::find(BACKENDS, name, &BackendInfo::cli);
 
-    return DisasmBackend::Zydis;
+    return found == BACKENDS.end() ? DisasmBackend::Zydis : (DisasmBackend)(found - BACKENDS.begin());
 }
 
 // True if `backend` can render `syntax`.
@@ -224,15 +220,6 @@ bool backend_supports(DisasmBackend backend, DisasmSyntax syntax) noexcept
     auto &info = backend_info(backend);
 
     return syntax == DisasmSyntax::ATT ? info.att_syntax : info.intel_syntax;
-}
-
-std::size_t g_page_size{};
-std::size_t g_allocation_granularity{};
-
-void init()
-{
-    g_page_size              = vm_page_size();
-    g_allocation_granularity = vm_allocation_granularity();
 }
 
 auto format_hex64_string(std::uint64_t value) { return fmt::format("0x{:016X}", value); }
@@ -275,9 +262,8 @@ std::string_view x87_tag_name(bool valid, const std::array<std::uint8_t, 10> &by
     std::uint64_t mantissa{};
     std::memcpy(&mantissa, bytes.data(), sizeof(mantissa));
 
-    auto exponent = (std::uint32_t)((bytes[9] << 8 | bytes[8]) & 0x7FFF);
-
     // Exponent 0 means zero when the mantissa is clear, otherwise a (pseudo-)denormal.
+    auto exponent = (std::uint32_t)((bytes[9] << 8 | bytes[8]) & 0x7FFF);
     if (exponent == 0)
     {
         return mantissa == 0 ? "Zero" : "Special";
@@ -371,52 +357,236 @@ auto decode_block(const std::string &prefix, const std::vector<std::string> &gro
     return ftxui::vbox(std::move(lines));
 }
 
-Result<std::vector<std::uint8_t>, std::string> parse_hex(std::string_view text)
+Result<std::vector<std::uint8_t>, std::string> parse_code_text(std::string_view text)
 {
-    // Check for whitespace-only input and reserve `result`.
-    std::size_t i{};
-    while (i < text.size() && std::isspace((std::uint8_t)text[i]) != 0)
+    auto skip_whitespace = [&text](std::size_t &position) noexcept
     {
-        ++i;
-    }
+        while (position < text.size() && std::isspace((std::uint8_t)text[position]) != 0)
+        {
+            ++position;
+        }
+    };
 
-    if (i == text.size())
+    auto parse_byte = [&text](std::size_t position) -> Result<std::uint8_t, std::string>
+    {
+        if (text.size() - position < 2)
+        {
+            return Error{fmt::format("Dangling hex nibble at position {}", position)};
+        }
+
+        std::uint8_t byte{};
+        auto        *pair             = text.data() + position;
+        auto [parsed_end, error_code] = std::from_chars(pair, pair + 2, byte, 16);
+        if (error_code != std::errc{} || parsed_end != pair + 2)
+        {
+            return Error{fmt::format("Invalid hex byte {:?} at position {}", text.substr(position, 2), position)};
+        }
+
+        return byte;
+    };
+
+    std::size_t position{};
+    skip_whitespace(position);
+
+    if (position == text.size())
     {
         return Error{"No code to run"};
     }
 
     std::vector<std::uint8_t> result{};
-    result.reserve((text.size() - i) / 2);
-    while (i < text.size())
+    result.reserve((text.size() - position) / 2);
+
+    if (text[position] == '{')
     {
-        if (std::isspace((std::uint8_t)text[i]) != 0)
+        ++position;
+
+        for (;;)
         {
-            ++i;
+            skip_whitespace(position);
+
+            if (position == text.size())
+            {
+                return Error{"Missing closing brace in byte array"};
+            }
+
+            if (text[position] == '}')
+            {
+                ++position;
+
+                skip_whitespace(position);
+
+                if (position != text.size())
+                {
+                    return Error{fmt::format("Unexpected text after byte array at position {}", position)};
+                }
+
+                return result.empty() ? Result<std::vector<std::uint8_t>, std::string>{Error{"No code to run"}} : result;
+            }
+
+            if (text.size() - position < 3 || text[position] != '0' || (text[position + 1] != 'x' && text[position + 1] != 'X'))
+            {
+                return Error{fmt::format("Expected a 0x-prefixed byte at position {}", position)};
+            }
+
+            position += 2;
+
+            auto digit_start = position;
+
+            while (position < text.size() && std::isxdigit((std::uint8_t)text[position]) != 0)
+            {
+                ++position;
+            }
+
+            auto digit_count = position - digit_start;
+            if (digit_count == 0)
+            {
+                return Error{fmt::format("Expected a hexadecimal byte at position {}", digit_start)};
+            }
+
+            if (digit_count > 2)
+            {
+                return Error{fmt::format("Byte value at position {} exceeds 0xFF", digit_start - 2)};
+            }
+
+            std::uint8_t byte{};
+            auto [parsed_end, error_code] = std::from_chars(text.data() + digit_start, text.data() + position, byte, 16);
+            if (error_code != std::errc{} || parsed_end != text.data() + position)
+            {
+                return Error{fmt::format("Invalid hexadecimal byte at position {}", digit_start - 2)};
+            }
+
+            result.emplace_back(byte);
+
+            skip_whitespace(position);
+
+            if (position < text.size() && text[position] == '}')
+            {
+                continue;
+            }
+
+            if (position == text.size() || text[position] != ',')
+            {
+                return Error{fmt::format("Expected a comma or closing brace at position {}", position)};
+            }
+
+            ++position;
+        }
+    }
+
+    if (text[position] == '\\')
+    {
+        while (position < text.size())
+        {
+            skip_whitespace(position);
+
+            if (position == text.size())
+            {
+                break;
+            }
+
+            if (text.size() - position < 4 || text[position] != '\\' || (text[position + 1] != 'x' && text[position + 1] != 'X'))
+            {
+                return Error{fmt::format("Expected a \\x-prefixed byte at position {}", position)};
+            }
+
+            auto byte = parse_byte(position + 2);
+            if (!byte)
+            {
+                return Error{byte.error()};
+            }
+
+            result.emplace_back(*byte);
+
+            position += 4;
+        }
+
+        return result;
+    }
+
+    while (position < text.size())
+    {
+        if (std::isspace((std::uint8_t)text[position]) != 0)
+        {
+            ++position;
 
             continue;
         }
 
-        // A byte needs two contiguous hex digits.
-        if (text.size() - i < 2 || std::isspace((std::uint8_t)text[i + 1]) != 0)
+        if (text.size() - position < 2 || std::isspace((std::uint8_t)text[position + 1]) != 0)
         {
-            return Error{fmt::format("Dangling hex nibble at position {}", i)};
+            return Error{fmt::format("Dangling hex nibble at position {}", position)};
         }
 
-        std::uint8_t byte{};
-        auto        *pair             = text.data() + i;
-        auto [parsed_end, error_code] = std::from_chars(pair, pair + 2, byte, 16);
-        if (error_code != std::errc{} || parsed_end != pair + 2)
+        auto byte = parse_byte(position);
+        if (!byte)
         {
-            return Error{fmt::format("Invalid hex byte {:?} at position {}", text.substr(i, 2), i)};
+            return Error{byte.error()};
         }
 
-        result.emplace_back(byte);
+        result.emplace_back(*byte);
 
-        i += 2;
+        position += 2;
     }
 
     return result;
 }
+
+namespace
+{
+
+// One maximum-length x86 instruction for every permitted step.
+constexpr std::size_t MAX_RAW_FILE_BYTES = MAX_STEPS_LIMIT * 15;
+
+Result<std::vector<std::uint8_t>, std::string> read_binary_input(std::string_view path)
+{
+    std::ifstream input{std::string(path), std::ios::binary | std::ios::ate};
+    if (!input)
+    {
+        return Error{fmt::format("Could not open input file {:?}", path)};
+    }
+
+    auto end = input.tellg();
+    if (end < 0)
+    {
+        return Error{fmt::format("Could not determine a usable size for input file {:?}", path)};
+    }
+
+    auto end_value = (std::uintmax_t)end;
+    if (end_value > std::numeric_limits<std::size_t>::max() || end_value > (std::uintmax_t)std::numeric_limits<std::streamsize>::max())
+    {
+        return Error{fmt::format("Could not determine a usable size for input file {:?}", path)};
+    }
+
+    if (end_value > MAX_RAW_FILE_BYTES)
+    {
+        return Error{fmt::format("Input file {:?} exceeds the {} byte limit", path, MAX_RAW_FILE_BYTES)};
+    }
+
+    std::vector<std::uint8_t> result((std::size_t)end_value);
+
+    input.seekg(0);
+
+    if (!result.empty())
+    {
+        input.read((char *)result.data(), (std::streamsize)result.size());
+    }
+
+    if (!input)
+    {
+        return Error{fmt::format("Could not read input file {:?}", path)};
+    }
+
+    if (result.empty())
+    {
+        return Error{"No code to run"};
+    }
+
+    return result;
+}
+
+std::string format_code_text(std::span<const std::uint8_t> code) { return fmt::format("{:02X}", fmt::join(code, " ")); }
+
+} // namespace
 
 // Parses a hex value (optional `0x`).
 // Empty text seeds zero.
@@ -427,7 +597,7 @@ Result<std::uint64_t, std::string> parse_seed(std::string_view seed)
         return 0;
     }
 
-    auto          offset = seed.size() >= 2 && seed[0] == '0' && (seed[1] == 'x' || seed[1] == 'X') ? 2 : 0;
+    std::size_t   offset = seed.size() >= 2 && seed[0] == '0' && (seed[1] == 'x' || seed[1] == 'X') ? 2 : 0;
     std::uint64_t result{};
     auto [parse_end, error_code] = std::from_chars(seed.data() + offset, seed.data() + seed.size(), result, 16);
     if (error_code != std::errc{} || parse_end != seed.data() + seed.size())
@@ -438,8 +608,35 @@ Result<std::uint64_t, std::string> parse_seed(std::string_view seed)
     return result;
 }
 
+namespace
+{
+
+Result<std::uint32_t, std::string> parse_mxcsr_seed(std::string_view text)
+{
+    auto value = parse_seed(text);
+    if (!value || *value > MXCSR_DEFINED_MASK)
+    {
+        return Error{fmt::format("Invalid MXCSR seed {:?} (expected defined bits 0 through 15).", text)};
+    }
+
+    return (std::uint32_t)*value;
+}
+
+Result<std::uint16_t, std::string> parse_fpu_control_word_seed(std::string_view text)
+{
+    auto value = parse_seed(text);
+    if (!value || *value > std::numeric_limits<std::uint16_t>::max())
+    {
+        return Error{fmt::format("Invalid control_word seed {:?} (expected up to 4 hexadecimal digits).", text)};
+    }
+
+    return (std::uint16_t)*value;
+}
+
+} // namespace
+
 // Parses a decimal with an optional trailing precision suffix.
-// `f`/`F` is single, `l`/`L`/none is double (long double == double on this ABI).
+// `f`/`F` selects single precision. `l`/`L`/none selects double precision.
 Result<DecimalSeed, std::string> parse_decimal_seed(std::string_view text, std::string_view label)
 {
     auto original_text      = text;
@@ -471,6 +668,7 @@ Result<DecimalSeed, std::string> parse_decimal_seed(std::string_view text, std::
     if (!magnitude.empty() && (magnitude.front() == '+' || magnitude.front() == '-'))
     {
         negative = magnitude.front() == '-';
+
         magnitude.remove_prefix(1);
     }
 
@@ -521,7 +719,7 @@ bool is_decimal_seed(std::string_view text) noexcept
 
 // Composes a 128-bit XMM seed from hex (up to 32 digits, optional `0x`) or a decimal (optional `f`/`l` suffix).
 // Single lands in the low 32 bits, double in the low 64 bits. Empty text seeds zero. Returns `{low, high}`.
-Result<std::array<std::uint64_t, 2>, std::string> compose_xmm_seed(const std::string &text)
+Result<std::array<std::uint64_t, 2>, std::string> compose_xmm_seed(std::string_view text)
 {
     if (text.empty())
     {
@@ -552,16 +750,16 @@ Result<std::array<std::uint64_t, 2>, std::string> compose_xmm_seed(const std::st
         return result;
     }
 
-    auto offset = text.size() >= 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X') ? (std::size_t)2 : (std::size_t)0;
-    auto digits = std::string_view(text).substr(offset);
+    std::size_t offset = text.size() >= 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X') ? 2 : 0;
+    auto        digits = text.substr(offset);
     if (digits.empty() || digits.size() > 32)
     {
         return Error{fmt::format("Invalid XMM seed {:?} (expected up to 32 hex digits).", text)};
     }
 
-    auto low_begin            = digits.size() > 16 ? digits.size() - 16 : (std::size_t)0;
-    auto low                  = digits.substr(low_begin);
-    auto high                 = digits.substr(0, low_begin);
+    std::size_t low_begin     = digits.size() > 16 ? digits.size() - 16 : 0;
+    auto        low           = digits.substr(low_begin);
+    auto        high          = digits.substr(0, low_begin);
     auto [low_end, low_error] = std::from_chars(low.data(), low.data() + low.size(), result[0], 16);
     if (low_error != std::errc{} || low_end != low.data() + low.size())
     {
@@ -581,7 +779,7 @@ Result<std::array<std::uint64_t, 2>, std::string> compose_xmm_seed(const std::st
 }
 
 // Composes an 80-bit x87 seed from hex (up to 20 digits, optional `0x`) or a decimal (optional `f`/`l` suffix, rounded to 80-bit on the FPU).
-Result<std::array<std::uint8_t, 10>, std::string> compose_st_seed(const std::string &text)
+Result<std::array<std::uint8_t, 10>, std::string> compose_st_seed(std::string_view text)
 {
     if (text.empty())
     {
@@ -604,8 +802,8 @@ Result<std::array<std::uint8_t, 10>, std::string> compose_st_seed(const std::str
         return result;
     }
 
-    auto offset = text.size() >= 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X') ? (std::size_t)2 : (std::size_t)0;
-    auto digits = std::string_view(text).substr(offset);
+    std::size_t offset = text.size() >= 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X') ? 2 : 0;
+    auto        digits = text.substr(offset);
     if (digits.empty() || digits.size() > 20)
     {
         return Error{fmt::format("Invalid ST seed {:?} (expected up to 20 hex digits).", text)};
@@ -628,11 +826,206 @@ Result<std::array<std::uint8_t, 10>, std::string> compose_st_seed(const std::str
     return result;
 }
 
+namespace
+{
+
+Result<std::uint64_t, std::string> parse_cli_seed_value(std::string_view text)
+{
+    auto value = parse_seed(text);
+    if (!value || text.empty())
+    {
+        return Error{fmt::format("Invalid `--seed` value {:?} (expected hex).", text)};
+    }
+
+    return *value;
+}
+
+std::optional<std::size_t> parse_xmm_seed_index(std::string_view text) noexcept
+{
+    if (text.size() < 4 || (text[0] != 'x' && text[0] != 'X') || (text[1] != 'm' && text[1] != 'M') || (text[2] != 'm' && text[2] != 'M'))
+    {
+        return {};
+    }
+
+    std::size_t result{};
+    auto [parse_end, error_code] = std::from_chars(text.data() + 3, text.data() + text.size(), result);
+    if (error_code != std::errc{} || parse_end != text.data() + text.size() || result >= 16)
+    {
+        return {};
+    }
+
+    return result;
+}
+
+std::optional<std::size_t> parse_st_seed_index(std::string_view text) noexcept
+{
+    if (text.size() != 3 || (text[0] != 's' && text[0] != 'S') || (text[1] != 't' && text[1] != 'T'))
+    {
+        return {};
+    }
+
+    std::size_t result{};
+    auto [parse_end, error_code] = std::from_chars(text.data() + 2, text.data() + text.size(), result);
+    if (error_code != std::errc{} || parse_end != text.data() + text.size() || result >= 8)
+    {
+        return {};
+    }
+
+    return result;
+}
+
+Result<void, std::string> parse_cli_seed_argument(std::string_view seed_text, CLI &cli)
+{
+    for (auto &&part : seed_text | std::views::split(','))
+    {
+        std::string_view entry{part};
+        if (entry.empty())
+        {
+            continue;
+        }
+
+        auto equals = entry.find('=');
+        if (equals == std::string_view::npos)
+        {
+            return Error{fmt::format("Invalid `--seed` entry {:?} (expected name=value).", entry)};
+        }
+
+        auto name       = entry.substr(0, equals);
+        auto value_text = entry.substr(equals + 1);
+        if (value_text.empty())
+        {
+            return Error{fmt::format("Invalid `--seed` entry {:?} (expected a non-empty value).", entry)};
+        }
+
+        if (ascii_case_insensitive_equal(name, "mxcsr"))
+        {
+            if (auto value = parse_mxcsr_seed(value_text); !value)
+            {
+                return Error{value.error()};
+            }
+
+            cli.seed_floating_environment.mxcsr = std::string(value_text);
+
+            continue;
+        }
+
+        if (ascii_case_insensitive_equal(name, "control_word"))
+        {
+            if (auto value = parse_fpu_control_word_seed(value_text); !value)
+            {
+                return Error{value.error()};
+            }
+
+            cli.seed_floating_environment.fpu_control_word = std::string(value_text);
+
+            continue;
+        }
+
+        if (auto xmm_index = parse_xmm_seed_index(name))
+        {
+            if (auto value = compose_xmm_seed(value_text); !value)
+            {
+                return Error{value.error()};
+            }
+
+            cli.seed_xmm[*xmm_index] = std::string(value_text);
+
+            continue;
+        }
+
+        if (auto st_index = parse_st_seed_index(name))
+        {
+            if (auto value = compose_st_seed(value_text); !value)
+            {
+                return Error{value.error()};
+            }
+
+            cli.seed_st[*st_index] = std::string(value_text);
+
+            continue;
+        }
+
+        std::string *slice{};
+        for (std::size_t reg{}; reg < GPR_COUNT && slice == nullptr; ++reg)
+        {
+            if (ascii_case_insensitive_equal(name, REG_NAMES[reg]))
+            {
+                slice = &cli.seed_gpr[reg].full;
+            }
+            else if (ascii_case_insensitive_equal(name, GPR_NAMES_32[reg]))
+            {
+                slice = &cli.seed_gpr[reg].dword;
+            }
+            else if (ascii_case_insensitive_equal(name, GPR_NAMES_16[reg]))
+            {
+                slice = &cli.seed_gpr[reg].word;
+            }
+            else if (ascii_case_insensitive_equal(name, GPR_NAMES_8L[reg]))
+            {
+                slice = &cli.seed_gpr[reg].byte_low;
+            }
+            else if (reg < GPR_NAMES_8H.size() && ascii_case_insensitive_equal(name, GPR_NAMES_8H[reg]))
+            {
+                slice = &cli.seed_gpr[reg].byte_high;
+            }
+
+            if (slice != nullptr && reg == (std::size_t)Reg::RSP)
+            {
+                return Error{"`--seed` can't set RSP or its sub-registers. RSP is engine-controlled (reset to the scratch-stack top)."};
+            }
+        }
+
+        if (slice != nullptr)
+        {
+            auto value = parse_cli_seed_value(value_text);
+            if (!value)
+            {
+                return Error{value.error()};
+            }
+
+            *slice = std::string(value_text);
+
+            continue;
+        }
+
+        bool matched{};
+        for (auto &&flag : STATUS_FLAGS)
+        {
+            if (ascii_case_insensitive_equal(name, flag.name))
+            {
+                auto value = parse_cli_seed_value(value_text);
+                if (!value)
+                {
+                    return Error{value.error()};
+                }
+
+                cli.seed_flags = *value != 0 ? cli.seed_flags | flag.bit : cli.seed_flags & ~flag.bit;
+                matched        = true;
+
+                break;
+            }
+        }
+
+        if (!matched)
+        {
+            return Error{fmt::format(
+                "Unknown `--seed` name {:?} (expected a GPR slice, XMM0..15, ST0..7, MXCSR, control_word, or a flag CF/PF/AF/ZF/SF/DF/OF).", name
+            )};
+        }
+    }
+
+    return {};
+}
+
+} // namespace
+
 Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
 {
     argparse::ArgumentParser program("bme", fmt::format("bme version {} ({} {})\n{}", BME_GIT_TAG, BME_GIT_URL, BME_GIT_HASH, BME_COPYRIGHT));
 
-    program.add_argument("--bytes").help("The input x86-64 bytes as hex, e.g. AABBCCDDEE.");
+    auto &input_group = program.add_mutually_exclusive_group();
+    input_group.add_argument("--bytes").help(R"(Formatted x86-64 bytes, e.g. 48FFC0, \x48\xFF\xC0, or {0x48, 0xFF, 0xC0}.)");
+    input_group.add_argument("--file").help("Read x86-64 machine code from a raw binary file.");
     program.add_argument("--run").flag().help("Run the code immediately after loading.");
 
     // Keep `.nargs(1)` after `.default_value()` for `--syntax`, `--backend`, and `--format`.
@@ -642,11 +1035,9 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
         .nargs(1)
         .choices("intel", "att")
         .help("Disassembly syntax: intel or att (default: intel).");
-
     program.add_argument("--max-steps")
         .help(fmt::format("Max instructions to single-step before aborting (default {}, max {}).", DEFAULT_MAX_STEPS, MAX_STEPS_LIMIT));
-
-    program.add_argument("--quick").flag().help("Print the trace to stdout and exit instead of opening the TUI (needs `--bytes`).");
+    program.add_argument("--quick").flag().help("Print the trace to stdout and exit instead of opening the TUI (needs `--bytes` or `--file`).");
     program.add_argument("--format")
         .default_value("text")
         .nargs(1)
@@ -657,10 +1048,9 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
         "Register classes to show in `--quick`, comma-separated: gpr,rip,rflags,xmm,x87 (or all/none). Default: gpr,rip,rflags."
     );
     program.add_argument("--seed").help(
-        "Seed registers/flags/XMM/ST as name=value, comma-separated. Hex, or a decimal with a dot or inf/nan (optional f/l suffix)."
-        " e.g. rax=10,cf=1,xmm0=abc,st0=1.5. GPR slices (not RSP), XMM0..15, ST0..7, flags CF/PF/AF/ZF/SF/DF/OF."
+        "Seed registers, flags, XMM, ST, MXCSR, and control_word as comma-separated name=value pairs. Values are hexadecimal, except XMM/ST also"
+        " accept decimal inf/nan with an optional f/l suffix. GPR slices exclude RSP. Flags are CF/PF/AF/ZF/SF/DF/OF."
     );
-
     program.add_argument("--backend")
         .default_value("zydis")
         .nargs(1)
@@ -676,9 +1066,8 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
         return Error{fmt::format("{}\n\t{}", exception.what(), program.usage())};
     }
 
-    auto quick           = program.get<bool>("--quick");
-    auto format_explicit = program.is_used("--format");
-    if (format_explicit && !quick)
+    auto quick = program.get<bool>("--quick");
+    if (program.is_used("--format") && !quick)
     {
         return Error{"`--format` requires `--quick`."};
     }
@@ -747,205 +1136,36 @@ Result<CLI, std::string> CLI::parse(std::int32_t argc, char *argv[])
         }
     }
 
-    // Initial register/flag state, comma-separated `name=value`.
-    // Applied to both the TUI seeds and `--quick`.
-    std::array<GPRSeed, GPR_COUNT> seed_gpr{};
-    std::uint64_t                  seed_flags{};
-    std::array<std::string, 16>    seed_xmm{};
-    std::array<std::string, 8>     seed_st{};
+    CLI result{};
+
     if (auto seed_text = program.present<std::string>("--seed"))
     {
-        // Strict hex parse (optional `0x`).
-        // Unlike the lenient TUI seed fields, a malformed CLI value is a hard error.
-        auto parse_value = [](std::string_view text) -> Result<std::uint64_t, std::string>
+        auto parsed_seed = parse_cli_seed_argument(*seed_text, result);
+        if (!parsed_seed)
         {
-            auto          offset = text.size() >= 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X') ? 2 : 0;
-            std::uint64_t result{};
-            auto [parse_end, error_code] = std::from_chars(text.data() + offset, text.data() + text.size(), result, 16);
-            if (error_code != std::errc{} || parse_end != text.data() + text.size() || text.size() == (std::size_t)offset)
-            {
-                return Error{fmt::format("Invalid `--seed` value {:?} (expected hex).", text)};
-            }
-
-            return result;
-        };
-
-        // Recognize an `xmm0`..`xmm15` name and return its index.
-        auto parse_xmm_index = [](std::string_view text) noexcept -> std::optional<std::size_t>
-        {
-            if (text.size() < 4 || (text[0] != 'x' && text[0] != 'X') || (text[1] != 'm' && text[1] != 'M') || (text[2] != 'm' && text[2] != 'M'))
-            {
-                return {};
-            }
-
-            std::size_t result{};
-            auto [parse_end, error_code] = std::from_chars(text.data() + 3, text.data() + text.size(), result);
-            if (error_code != std::errc{} || parse_end != text.data() + text.size() || result >= 16)
-            {
-                return {};
-            }
-
-            return result;
-        };
-
-        // Recognize an `st0`..`st7` name and return its index.
-        auto parse_st_index = [](std::string_view text) noexcept -> std::optional<std::size_t>
-        {
-            if (text.size() != 3 || (text[0] != 's' && text[0] != 'S') || (text[1] != 't' && text[1] != 'T'))
-            {
-                return {};
-            }
-
-            std::size_t result{};
-            auto [parse_end, error_code] = std::from_chars(text.data() + 2, text.data() + text.size(), result);
-            if (error_code != std::errc{} || parse_end != text.data() + text.size() || result >= 8)
-            {
-                return {};
-            }
-
-            return result;
-        };
-
-        for (auto &&part : *seed_text | std::views::split(','))
-        {
-            std::string_view entry{part};
-            if (entry.empty())
-            {
-                continue;
-            }
-
-            auto equals = entry.find('=');
-            if (equals == std::string_view::npos)
-            {
-                return Error{fmt::format("Invalid `--seed` entry {:?} (expected name=value).", entry)};
-            }
-
-            auto name       = entry.substr(0, equals);
-            auto value_text = entry.substr(equals + 1);
-
-            // XMM register `xmm0..xmm15`.
-            // Hex or a decimal (optional `f`/`l` suffix).
-            if (auto xmm_index = parse_xmm_index(name))
-            {
-                if (auto value = compose_xmm_seed(std::string(value_text)); !value)
-                {
-                    return Error{value.error()};
-                }
-
-                seed_xmm[*xmm_index] = std::string(value_text);
-
-                continue;
-            }
-
-            // ST register `st0..st7`.
-            // An 80-bit hex value or a decimal (optional `f`/`l` suffix).
-            if (auto st_index = parse_st_index(name))
-            {
-                if (auto value = compose_st_seed(std::string(value_text)); !value)
-                {
-                    return Error{value.error()};
-                }
-
-                seed_st[*st_index] = std::string(value_text);
-
-                continue;
-            }
-
-            // Full GPR or a sub-register slice (`RAX` / `EAX` / `AX` / `AH` / `AL`).
-            // Each slice writes its own `GPRSeed` field so `compose_gpr_seed` overlays them exactly like the TUI does.
-            std::string *slice{};
-            for (std::size_t reg{}; reg < GPR_COUNT && slice == nullptr; ++reg)
-            {
-                if (ascii_case_insensitive_equal(name, REG_NAMES[reg]))
-                {
-                    slice = &seed_gpr[reg].full;
-                }
-                else if (ascii_case_insensitive_equal(name, GPR_NAMES_32[reg]))
-                {
-                    slice = &seed_gpr[reg].dword;
-                }
-                else if (ascii_case_insensitive_equal(name, GPR_NAMES_16[reg]))
-                {
-                    slice = &seed_gpr[reg].word;
-                }
-                else if (ascii_case_insensitive_equal(name, GPR_NAMES_8L[reg]))
-                {
-                    slice = &seed_gpr[reg].byte_low;
-                }
-                else if (reg < GPR_NAMES_8H.size() && ascii_case_insensitive_equal(name, GPR_NAMES_8H[reg]))
-                {
-                    slice = &seed_gpr[reg].byte_high;
-                }
-
-                if (slice != nullptr && reg == (std::size_t)Reg::RSP)
-                {
-                    return Error{"`--seed` can't set RSP or its sub-registers. RSP is engine-controlled (reset to the scratch-stack top)."};
-                }
-            }
-
-            if (slice != nullptr)
-            {
-                auto value = parse_value(value_text);
-                if (!value)
-                {
-                    return Error{value.error()};
-                }
-
-                *slice = std::string(value_text);
-
-                continue;
-            }
-
-            // Status flag.
-            bool matched{};
-            for (auto &&flag : STATUS_FLAGS)
-            {
-                if (ascii_case_insensitive_equal(name, flag.name))
-                {
-                    auto value = parse_value(value_text);
-                    if (!value)
-                    {
-                        return Error{value.error()};
-                    }
-
-                    seed_flags = *value != 0 ? seed_flags | flag.bit : seed_flags & ~flag.bit;
-                    matched    = true;
-
-                    break;
-                }
-            }
-
-            if (!matched)
-            {
-                return Error{
-                    fmt::format("Unknown `--seed` name {:?} (expected a GPR slice, XMM0..15, ST0..7, or a flag CF/PF/AF/ZF/SF/DF/OF).", name)
-                };
-            }
+            return Error{parsed_seed.error()};
         }
     }
 
-    auto backend = backend_from_cli(program.get<std::string>("--backend"));
     auto syntax  = program.get<std::string>("--syntax") == "att" ? DisasmSyntax::ATT : DisasmSyntax::Intel;
+    auto backend = backend_from_cli(program.get<std::string>("--backend"));
     if (!backend_supports(backend, syntax))
     {
         return Error{fmt::format("The {} backend only emits Intel syntax (use `--syntax intel`).", backend_info(backend).name)};
     }
 
-    return CLI{
-        .bytes       = program.present<std::string>("--bytes"),
-        .run         = program.get<bool>("--run"),
-        .quick       = quick,
-        .format      = format_is_json ? OutputFormat::Json : OutputFormat::Text,
-        .pretty_json = pretty_json,
-        .syntax      = syntax,
-        .backend     = backend,
-        .max_steps   = max_steps,
-        .track       = track,
-        .seed_gpr    = seed_gpr,
-        .seed_flags  = seed_flags,
-        .seed_xmm    = seed_xmm,
-        .seed_st     = seed_st,
-    };
+    result.bytes       = program.present<std::string>("--bytes");
+    result.input_file  = program.present<std::string>("--file");
+    result.run         = program.get<bool>("--run");
+    result.quick       = quick;
+    result.format      = format_is_json ? OutputFormat::Json : OutputFormat::Text;
+    result.pretty_json = pretty_json;
+    result.syntax      = syntax;
+    result.backend     = backend;
+    result.max_steps   = max_steps;
+    result.track       = track;
+
+    return result;
 }
 
 namespace
@@ -1039,10 +1259,25 @@ Decoded disasm_one(DisasmBackend backend, DisasmSyntax syntax, std::uint64_t add
     return result;
 }
 
-// Reservation base for the scratch data region.
-// The fixed VA rounded down to the allocation granularity (where `MEM_RESERVE` lands it anyway). Usable memory (what seeds and `[mem]` target) starts
-// one guard page above.
-std::uint64_t scratch_reserve_base() noexcept { return SCRATCH_DATA_RESERVE_BASE & ~(g_allocation_granularity - 1); }
+auto format_address_value(const Trace &trace, std::uint64_t address, bool normalized)
+{
+    if (normalized)
+    {
+        auto code_base = trace.seed[Reg::RIP];
+        if (code_base != 0 && address >= code_base && address - code_base < trace.code.size())
+        {
+            return fmt::format("code+{:04X}", address - code_base);
+        }
+
+        auto data_base = scratch_data_base();
+        if (address >= data_base && address - data_base < SCRATCH_DATA_BYTES)
+        {
+            return fmt::format("data+{:04X}", address - data_base);
+        }
+    }
+
+    return format_hex64_string(address);
+}
 
 } // namespace
 
@@ -1163,7 +1398,13 @@ std::vector<HistoryRow> build_history(const Trace &trace, DisasmBackend backend,
 // Execute `code` one instruction at a time, capturing register state after each.
 // Single-step faults and instruction-count runaways are contained.
 Trace run_engine(
-    std::span<std::uint8_t> code, const Registers &seed, std::size_t max_steps, DisasmBackend backend, DisasmSyntax syntax, bool seed_data_pointers
+    std::span<std::uint8_t>    code,
+    const Registers           &seed,
+    std::size_t                max_steps,
+    DisasmBackend              backend,
+    DisasmSyntax               syntax,
+    bool                       seed_data_pointers,
+    std::optional<std::size_t> stop_offset
 )
 {
     Trace trace{};
@@ -1178,11 +1419,11 @@ Trace run_engine(
     std::lock_guard engine_lock{g_engine_mutex};
 
     auto result = run_platform_steps({
-        .code                 = code,
-        .seed                 = seed,
-        .max_steps            = trace.effective_max_steps,
-        .scratch_reserve_base = scratch_reserve_base(),
-        .seed_data_pointers   = seed_data_pointers,
+        .code               = code,
+        .seed               = seed,
+        .max_steps          = trace.effective_max_steps,
+        .stop_offset        = stop_offset,
+        .seed_data_pointers = seed_data_pointers,
     });
 
     trace.seed                     = result.seed;
@@ -1223,8 +1464,17 @@ Trace run_engine(
     {
     case Outcome::Stopped:
     {
-        trace.message      = fmt::format("Stopped at int3 (0x{:X}) - {} executed.", result.stop_address, executed);
-        trace.stop_reason  = "Stopped here - int3 breakpoint";
+        if (result.stopped_at_target)
+        {
+            trace.message     = fmt::format("Stopped at selected row (0x{:X}) - {} executed.", result.stop_address, executed);
+            trace.stop_reason = "Stopped here - selected row";
+        }
+        else
+        {
+            trace.message     = fmt::format("Stopped at int3 (0x{:X}) - {} executed.", result.stop_address, executed);
+            trace.stop_reason = "Stopped here - int3 breakpoint";
+        }
+
         trace.stop_address = result.stop_address;
 
         break;
@@ -1268,15 +1518,17 @@ namespace
 struct UI
 {
     // Input.
-    std::string                    code{};                           // Hex byte input.
+    std::string                    code{};                           // Formatted byte input.
     DisasmBackend                  backend   = DisasmBackend::Zydis; // Active decode backend (Zydis default).
     DisasmSyntax                   syntax    = DisasmSyntax::Intel;  // Active disassembly syntax (Intel default).
     std::size_t                    max_steps = DEFAULT_MAX_STEPS;    // Single-step cap for the next run.
     std::array<GPRSeed, GPR_COUNT> seed_gpr{};                       // Editable `RAX..R15` seeds (per-slice hex).
     std::uint64_t                  seed_flags{};                     // Seeded status flags (`CF/PF/AF/ZF/SF/DF/OF`). Applied on run.
-    std::array<std::string, 16>    seed_xmm{};                       // Seeded `XMM0..15` as hex or decimal with optional precision. Applied on run.
-    std::array<std::string, 8>     seed_st{};                 // Seeded `ST0..ST7` as 80-bit hex or decimal with optional precision. Applied on run.
-    bool                           seed_data_pointers = true; // Point `RDI`/`RSI` at the scratch data base when left unseeded.
+    std::array<std::string, 16>    seed_xmm{};                       // Seeded `XMM0..15` as hex or decimal with optional precision.
+    std::array<std::string, 8>     seed_st{};                        // Seeded `ST0..ST7` as 80-bit hex or decimal with optional precision.
+    FloatingEnvironmentSeed        seed_floating_environment{};      // Optional `MXCSR` and x87 control-word seeds.
+    bool                           seed_data_pointers   = true;      // Point `RDI`/`RSI` at the scratch data base when left unseeded.
+    bool                           normalized_addresses = true;      // Normalize code and scratch data addresses.
 
     // Execution result and timeline navigation.
     Trace                                               trace{};
@@ -1428,18 +1680,45 @@ std::uint64_t compose_gpr_seed(const GPRSeed &seed, std::string_view label, std:
     return result;
 }
 
-// Composes seeded `Registers` from the per-register seed text (`GPR` slices, `RFLAGS`, `XMM`, `ST`), shared by the TUI's Run and `--quick`.
-// A malformed field is left unseeded, never blocking the run, and reported in `errors`. Unlike `--seed`'s hard error at CLI parse time, this is
-// always lenient.
+// Composes seeded `Registers` from the text fields shared by the TUI's Run and `--quick`.
+// A malformed field is left at its default, never blocking the run, and reported in `errors`.
 Registers compose_seed(
     const std::array<GPRSeed, GPR_COUNT> &seed_gpr,
     std::uint64_t                         seed_flags,
     const std::array<std::string, 16>    &seed_xmm,
     const std::array<std::string, 8>     &seed_st,
+    const FloatingEnvironmentSeed        &seed_floating_environment,
     std::vector<std::string>             &errors
 )
 {
     Registers seed{};
+
+    if (!seed_floating_environment.mxcsr.empty())
+    {
+        auto value = parse_mxcsr_seed(seed_floating_environment.mxcsr);
+        if (value)
+        {
+            seed.mxcsr = *value;
+        }
+        else
+        {
+            errors.emplace_back(value.error());
+        }
+    }
+
+    if (!seed_floating_environment.fpu_control_word.empty())
+    {
+        auto value = parse_fpu_control_word_seed(seed_floating_environment.fpu_control_word);
+        if (value)
+        {
+            seed.fpu_control_word = *value;
+        }
+        else
+        {
+            errors.emplace_back(value.error());
+        }
+    }
+
     for (std::size_t i{}; i < GPR_COUNT; ++i)
     {
         seed.gpr[i] = compose_gpr_seed(seed_gpr[i], REG_NAMES[i], errors);
@@ -1481,6 +1760,21 @@ Registers compose_seed(
 const auto &history_rows_at(const UI &ui, std::int32_t tab) noexcept
 {
     return tab == 0 ? ui.history_rows : ui.history_backend_rows[(std::size_t)tab - 1];
+}
+
+const auto &history_lines_at(const UI &ui, std::int32_t tab) noexcept { return tab == 0 ? ui.history : ui.history_backend[(std::size_t)tab - 1]; }
+
+bool history_selection_is_static(const UI &ui) noexcept
+{
+    auto &rows = history_rows_at(ui, ui.history_tab);
+    if (ui.cursor <= 0 || (std::size_t)ui.cursor > rows.size())
+    {
+        return false;
+    }
+
+    auto kind = rows[(std::size_t)ui.cursor - 1].kind;
+
+    return kind == HistoryRowKind::NotReached || kind == HistoryRowKind::Data;
 }
 
 const auto &history_state_at(const UI &ui, std::size_t position) noexcept
@@ -1557,7 +1851,7 @@ void restore_history_selection(UI &ui, const HistorySelection &selection) noexce
     ui.cursor = std::min(ui.cursor, (std::int32_t)rows.size());
 }
 
-auto build_history_lines(const Trace &trace, const std::vector<HistoryRow> &rows)
+auto build_history_lines(const Trace &trace, const std::vector<HistoryRow> &rows, bool relative_addresses)
 {
     std::vector<std::string> lines{"- Initial (seed)"};
 
@@ -1575,12 +1869,13 @@ auto build_history_lines(const Trace &trace, const std::vector<HistoryRow> &rows
     std::size_t execution_position{};
     for (auto &&row : rows)
     {
-        auto bytes = fmt::format("{:02X}", fmt::join(std::span{trace.code}.subspan(row.offset, row.length), " "));
+        auto bytes   = fmt::format("{:02X}", fmt::join(std::span{trace.code}.subspan(row.offset, row.length), " "));
+        auto address = relative_addresses ? fmt::format("code+{:04X}", row.offset) : fmt::format("{:08X}", row.rip);
         if (row.kind == HistoryRowKind::Reached)
         {
             ++execution_position;
 
-            lines.emplace_back(fmt::format("{:>3}  {:08X}  {:<{}}  {}", execution_position, row.rip, bytes, bytes_width, row.text));
+            lines.emplace_back(fmt::format("{:>3}  {}  {:<{}}  {}", execution_position, address, bytes, bytes_width, row.text));
         }
         else
         {
@@ -1588,7 +1883,7 @@ auto build_history_lines(const Trace &trace, const std::vector<HistoryRow> &rows
             auto is_stop = row.rip == trace.stop_address && !trace.stop_reason.empty();
             auto note    = is_stop ? trace.stop_reason : std::string_view{"Not reached"};
 
-            lines.emplace_back(fmt::format("{:>3}  {:08X}  {:<{}}  {} ({})", marker, row.rip, bytes, bytes_width, row.text, note));
+            lines.emplace_back(fmt::format("{:>3}  {}  {:<{}}  {} ({})", marker, address, bytes, bytes_width, row.text, note));
         }
     }
 
@@ -1601,14 +1896,13 @@ void rebuild_history(UI &ui)
     auto selection = history_selection(ui, ui.history_tab);
 
     ui.history_rows = build_history(ui.trace, ui.backend, ui.syntax);
-    ui.history      = build_history_lines(ui.trace, ui.history_rows);
+    ui.history      = build_history_lines(ui.trace, ui.history_rows, ui.normalized_addresses);
 
     for (std::size_t backend{}; backend < BACKEND_COUNT; ++backend)
     {
-        auto syntax = backend_supports((DisasmBackend)backend, ui.syntax) ? ui.syntax : DisasmSyntax::Intel;
-
+        auto syntax                      = backend_supports((DisasmBackend)backend, ui.syntax) ? ui.syntax : DisasmSyntax::Intel;
         ui.history_backend_rows[backend] = build_history(ui.trace, (DisasmBackend)backend, syntax);
-        ui.history_backend[backend]      = build_history_lines(ui.trace, ui.history_backend_rows[backend]);
+        ui.history_backend[backend]      = build_history_lines(ui.trace, ui.history_backend_rows[backend], ui.normalized_addresses);
     }
 
     restore_history_selection(ui, selection);
@@ -1626,6 +1920,18 @@ std::int32_t run_tui(const CLI &cli)
     {
         ui.code = *cli.bytes;
     }
+    else if (cli.input_file)
+    {
+        auto input = read_binary_input(*cli.input_file);
+        if (input)
+        {
+            ui.code = format_code_text(*input);
+        }
+        else
+        {
+            ui.status = fmt::format("Error: {}.", input.error());
+        }
+    }
 
     ui.backend   = cli.backend;
     ui.syntax    = cli.syntax;
@@ -1639,14 +1945,15 @@ std::int32_t run_tui(const CLI &cli)
 
     // Pre-fill the TUI seed fields from `--seed`.
     // Each `GPRSeed` maps straight onto the panel's per-slice inputs.
-    ui.seed_gpr   = cli.seed_gpr;
-    ui.seed_flags = cli.seed_flags;
-    ui.seed_xmm   = cli.seed_xmm;
-    ui.seed_st    = cli.seed_st;
+    ui.seed_gpr                  = cli.seed_gpr;
+    ui.seed_flags                = cli.seed_flags;
+    ui.seed_xmm                  = cli.seed_xmm;
+    ui.seed_st                   = cli.seed_st;
+    ui.seed_floating_environment = cli.seed_floating_environment;
 
-    auto run = [&ui]
+    auto execute = [&ui](std::optional<std::size_t> stop_offset)
     {
-        auto decoded = parse_hex(ui.code);
+        auto decoded = parse_code_text(ui.code);
         if (!decoded)
         {
             ui.status = fmt::format("Error: {}.", decoded.error());
@@ -1654,12 +1961,19 @@ std::int32_t run_tui(const CLI &cli)
             return;
         }
 
+        if (stop_offset && *decoded != ui.trace.code)
+        {
+            ui.status = "Run first to refresh History after editing bytes.";
+
+            return;
+        }
+
         // Malformed seed text is lenient here (unlike `--seed`'s hard error at CLI parse time).
         // The run still proceeds with that field left unseeded, and the reason is appended to the status line instead of being silently discarded.
         std::vector<std::string> seed_errors{};
-        auto                     seed = compose_seed(ui.seed_gpr, ui.seed_flags, ui.seed_xmm, ui.seed_st, seed_errors);
+        auto                     seed = compose_seed(ui.seed_gpr, ui.seed_flags, ui.seed_xmm, ui.seed_st, ui.seed_floating_environment, seed_errors);
 
-        ui.trace  = run_engine(*decoded, seed, ui.max_steps, ui.backend, ui.syntax, ui.seed_data_pointers);
+        ui.trace  = run_engine(*decoded, seed, ui.max_steps, ui.backend, ui.syntax, ui.seed_data_pointers, stop_offset);
         ui.cursor = 0;
 
         if (ui.trace.instrumentation_detected)
@@ -1669,12 +1983,19 @@ std::int32_t run_tui(const CLI &cli)
 
         rebuild_history(ui);
 
+        if (stop_offset && ui.trace.stop_address == ui.trace.seed[Reg::RIP] + *stop_offset)
+        {
+            restore_history_selection(ui, HistorySelection{.rip = ui.trace.stop_address, .has_row = true});
+        }
+
         ui.status = fmt::format("{} bytes - {}", decoded->size(), ui.trace.message);
         if (!seed_errors.empty())
         {
             ui.status += fmt::format(" (seed errors, left unseeded: {})", fmt::join(seed_errors, "; "));
         }
     };
+
+    auto run = [&execute] { execute({}); };
 
     // Advance to the next completed instruction or partial fault state.
     // Not-reached rows stay browsable through the history menu.
@@ -1860,6 +2181,12 @@ std::int32_t run_tui(const CLI &cli)
         xmm_seed_components.emplace_back(xmm_inputs[i]);
     }
 
+    auto mxcsr_seed_option        = xmm_seed_option;
+    mxcsr_seed_option.placeholder = "1F80";
+
+    auto mxcsr_input = ftxui::Input(&ui.seed_floating_environment.mxcsr, mxcsr_seed_option);
+    xmm_seed_components.emplace_back(mxcsr_input);
+
     xmm_seed_components.emplace_back(xmm_focus_sink);
 
     auto xmm_seed_selected  = (std::int32_t)xmm_seed_components.size() - 1;
@@ -1880,15 +2207,52 @@ std::int32_t run_tui(const CLI &cli)
         st_seed_components.emplace_back(st_inputs[i]);
     }
 
+    auto fpu_control_word_seed_option        = st_seed_option;
+    fpu_control_word_seed_option.placeholder = "037F";
+
+    auto fpu_control_word_input = ftxui::Input(&ui.seed_floating_environment.fpu_control_word, fpu_control_word_seed_option);
+    st_seed_components.emplace_back(fpu_control_word_input);
+
     st_seed_components.emplace_back(st_focus_sink);
 
     auto st_seed_selected  = (std::int32_t)st_seed_components.size() - 1;
     auto st_seed_container = ftxui::Container::Vertical(st_seed_components, &st_seed_selected);
 
-    auto run_button   = ftxui::Button("Run", run, ftxui::ButtonOption::Ascii());
-    auto step_button  = ftxui::Button("Step", step, ftxui::ButtonOption::Ascii());
-    auto back_button  = ftxui::Button("Back", back, ftxui::ButtonOption::Ascii());
-    auto reset_button = ftxui::Button("Reset", reset, ftxui::ButtonOption::Ascii());
+    auto run_to_selected_row = [&ui, &execute]
+    {
+        auto &rows = history_rows_at(ui, ui.history_tab);
+        if (ui.cursor <= 0 || (std::size_t)ui.cursor > rows.size())
+        {
+            ui.status = "Select a History row to run to.";
+
+            return;
+        }
+
+        execute(rows[(std::size_t)ui.cursor - 1].offset);
+    };
+
+    auto copy_history_row = [&ui]
+    {
+        auto &rows = history_rows_at(ui, ui.history_tab);
+        if (ui.cursor <= 0 || (std::size_t)ui.cursor > rows.size())
+        {
+            ui.status = "Select a History row to copy.";
+
+            return;
+        }
+
+        auto &lines = history_lines_at(ui, ui.history_tab);
+        auto  line  = trim(std::string_view{lines[(std::size_t)ui.cursor]});
+
+        ui.status = copy_to_clipboard(line) ? "Copied selected History row to clipboard." : "Clipboard copy failed.";
+    };
+
+    auto run_button          = ftxui::Button("Run", run, ftxui::ButtonOption::Ascii());
+    auto run_to_button       = ftxui::Button("Run to row", run_to_selected_row, ftxui::ButtonOption::Ascii());
+    auto step_button         = ftxui::Button("Step", step, ftxui::ButtonOption::Ascii());
+    auto back_button         = ftxui::Button("Back", back, ftxui::ButtonOption::Ascii());
+    auto copy_history_button = ftxui::Button("Copy row", copy_history_row, ftxui::ButtonOption::Ascii());
+    auto reset_button        = ftxui::Button("Reset", reset, ftxui::ButtonOption::Ascii());
 
     // Cycling buttons.
     // Left-click advances, right-click (within the button's reflected box) steps back.
@@ -1932,7 +2296,9 @@ std::int32_t run_tui(const CLI &cli)
 
     auto screen      = ftxui::ScreenInteractive::Fullscreen();
     auto quit_button = ftxui::Button("Quit", screen.ExitLoopClosure(), ftxui::ButtonOption::Ascii());
-    auto buttons     = ftxui::Container::Horizontal({run_button, step_button, back_button, reset_button, settings_button, about_button, quit_button});
+    auto buttons     = ftxui::Container::Horizontal(
+        {run_button, run_to_button, step_button, back_button, copy_history_button, reset_button, settings_button, about_button, quit_button}
+    );
 
     std::vector<std::string> history_tab_labels{"Main"};
     for (auto &&info : BACKENDS)
@@ -1940,10 +2306,62 @@ std::int32_t run_tui(const CLI &cli)
         history_tab_labels.emplace_back(info.name);
     }
 
-    std::vector history_menus{ftxui::Menu(&ui.history, &ui.cursor, ftxui::MenuOption::Vertical())};
+    auto history_menu_option = [&ui](std::int32_t tab)
+    {
+        auto option                     = ftxui::MenuOption::Vertical();
+        option.entries_option.transform = [&ui, tab](const ftxui::EntryState &state)
+        {
+            auto element = ftxui::text((state.active ? "> " : "  ") + state.label);
+            if (state.index > 0)
+            {
+                auto &rows  = history_rows_at(ui, tab);
+                auto  index = (std::size_t)state.index - 1;
+                if (index < rows.size())
+                {
+                    auto &row     = rows[index];
+                    auto  is_stop = row.rip == ui.trace.stop_address && !ui.trace.stop_reason.empty();
+
+                    if (row.kind == HistoryRowKind::Faulted)
+                    {
+                        element |= ftxui::color(ftxui::Color::LightCoral);
+                    }
+                    else if (is_stop)
+                    {
+                        element |= ftxui::color(ftxui::Color::Yellow);
+                    }
+
+                    if ((row.kind == HistoryRowKind::NotReached || row.kind == HistoryRowKind::Data) && !is_stop)
+                    {
+                        element |= ftxui::dim;
+                    }
+
+                    if (row.kind == HistoryRowKind::Faulted || is_stop)
+                    {
+                        element |= ftxui::bold;
+                    }
+                }
+            }
+
+            if (state.focused)
+            {
+                element |= ftxui::inverted;
+            }
+
+            if (state.active)
+            {
+                element |= ftxui::bold;
+            }
+
+            return element;
+        };
+
+        return option;
+    };
+
+    std::vector history_menus{ftxui::Menu(&ui.history, &ui.cursor, history_menu_option(0))};
     for (std::size_t i{}; i < BACKEND_COUNT; ++i)
     {
-        history_menus.emplace_back(ftxui::Menu(&ui.history_backend[i], &ui.cursor, ftxui::MenuOption::Vertical()));
+        history_menus.emplace_back(ftxui::Menu(&ui.history_backend[i], &ui.cursor, history_menu_option((std::int32_t)i + 1)));
     }
 
     auto history_tabs = ftxui::Container::Tab(history_menus, &ui.history_tab);
@@ -2073,11 +2491,13 @@ std::int32_t run_tui(const CLI &cli)
             // `RIP` (entry point), `RSP` (scratch-stack top), `RFLAGS` (live flags). No seed, no drill-down.
             if (reg == Reg::RIP || reg == Reg::RSP || reg == Reg::RFLAGS)
             {
-                auto name = ftxui::text(std::string("  ") + std::string(REG_NAMES[(std::size_t)reg])) | ftxui::bold;
-                auto text = has_trace ? format_hex64_string(current[reg]) : std::string("-");
-                auto val  = make_value(text, current[reg] != previous[reg]);
+                auto name      = ftxui::text(std::string("  ") + std::string(REG_NAMES[(std::size_t)reg])) | ftxui::bold;
+                auto copy_text = has_trace ? format_hex64_string(current[reg]) : std::string("-");
+                auto text      = has_trace ? (reg == Reg::RFLAGS ? copy_text : format_address_value(ui.trace, current[reg], ui.normalized_addresses))
+                                           : std::string("-");
+                auto val       = make_value(text, current[reg] != previous[reg]);
 
-                rows.emplace_back(ftxui::Elements{ftxui::emptyElement(), name, has_trace ? copy_cell(val, text) : val});
+                rows.emplace_back(ftxui::Elements{ftxui::emptyElement(), name, has_trace ? copy_cell(val, copy_text) : val});
 
                 continue;
             }
@@ -2102,11 +2522,12 @@ std::int32_t run_tui(const CLI &cli)
                     name = name | ftxui::reflect(gpr_hits.back().box);
                 }
 
-                auto seed = seed_component ? seed_component->Render() | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, 18) : ftxui::emptyElement();
-                auto text = has_trace ? fmt::format("0x{:0{}X}", value, hex_digits) : std::string("-");
+                auto seed      = seed_component ? seed_component->Render() | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, 18) : ftxui::emptyElement();
+                auto copy_text = has_trace ? fmt::format("0x{:0{}X}", value, hex_digits) : std::string("-");
+                auto text = has_trace ? (level == 0 ? format_address_value(ui.trace, value, ui.normalized_addresses) : copy_text) : std::string("-");
                 auto val  = make_value(text, value != prev_value);
 
-                rows.emplace_back(ftxui::Elements{seed, name, has_trace ? copy_cell(val, text) : val});
+                rows.emplace_back(ftxui::Elements{seed, name, has_trace ? copy_cell(val, copy_text) : val});
             };
 
             emit(0, REG_NAMES[i], full, prev, 16, seed_inputs[i].full);
@@ -2171,6 +2592,13 @@ std::int32_t run_tui(const CLI &cli)
             tokens.emplace_back(ftxui::text("  "));
         }
 
+        auto &rows = history_rows_at(ui, ui.history_tab);
+        if (position > 0 && position <= rows.size() && rows[position - 1].kind == HistoryRowKind::Faulted && (flags & RFLAGS_RESUME_FLAG) != 0)
+        {
+            tokens.emplace_back(ftxui::text("|  "));
+            tokens.emplace_back(ftxui::text("RF") | ftxui::color(ftxui::Color::Yellow) | ftxui::bold);
+        }
+
         return ftxui::hbox(std::move(tokens));
     };
 
@@ -2200,7 +2628,7 @@ std::int32_t run_tui(const CLI &cli)
         }
     );
 
-    auto render_xmm = [&ui, &xmm_inputs, &xmm_hits, &copy_hits, &copy_cell]
+    auto render_xmm = [&ui, &xmm_inputs, &mxcsr_input, &xmm_hits, &copy_hits, &copy_cell]
     {
         std::vector<ftxui::Elements> rows{ftxui::Elements{ftxui::text("Seed"), ftxui::text("Register"), ftxui::text("Value (hi : lo)")}};
 
@@ -2283,15 +2711,17 @@ std::int32_t run_tui(const CLI &cli)
             }
         }
 
-        // `MXCSR` as a table row so its value lines up under the `XMM` values (same separator column).
-        // No seed input.
+        // `MXCSR` as a table row so its value lines up under the `XMM` values.
         auto mxcsr_text  = has_trace ? fmt::format("0x{:08X}", current.mxcsr) : std::string("-");
         auto mxcsr_value = ftxui::text(mxcsr_text);
         mxcsr_value =
             has_trace && current.mxcsr != previous.mxcsr ? mxcsr_value | ftxui::color(ftxui::Color::Yellow) | ftxui::bold : mxcsr_value | ftxui::dim;
 
         rows.emplace_back(
-            ftxui::Elements{ftxui::emptyElement(), ftxui::text("MXCSR") | ftxui::bold, has_trace ? copy_cell(mxcsr_value, mxcsr_text) : mxcsr_value}
+            ftxui::Elements{
+                mxcsr_input->Render() | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, 20), ftxui::text("MXCSR") | ftxui::bold,
+                has_trace ? copy_cell(mxcsr_value, mxcsr_text) : mxcsr_value
+            }
         );
 
         auto table = ftxui::Table(std::move(rows));
@@ -2308,7 +2738,7 @@ std::int32_t run_tui(const CLI &cli)
         return ftxui::vbox({table.Render(), decode_block("", decode_mxcsr(current.mxcsr))});
     };
 
-    auto render_x87 = [&ui, &st_inputs, &st_hits, &copy_hits, &copy_cell]
+    auto render_x87 = [&ui, &st_inputs, &fpu_control_word_input, &st_hits, &copy_hits, &copy_cell]
     {
         std::vector<ftxui::Elements> rows{};
         rows.emplace_back(
@@ -2327,10 +2757,10 @@ std::int32_t run_tui(const CLI &cli)
         st_hits.clear();
         st_hits.reserve(current.st.size());
 
-        // Raw storage is always copyable, decimal values require an occupied x87 tag.
-        // Reserve 3 targets per `ST` so `ftxui::reflect()` box refs stay stable.
+        // Raw storage and the control word are copyable, decimal values require an occupied x87 tag.
+        // Reserve 3 targets per `ST` plus the control word so `ftxui::reflect()` box refs stay stable.
         copy_hits.clear();
-        copy_hits.reserve(current.st.size() * 3);
+        copy_hits.reserve(current.st.size() * 3 + 1);
 
         for (std::int32_t i{}; i < (std::int32_t)current.st.size(); ++i)
         {
@@ -2401,6 +2831,23 @@ std::int32_t run_tui(const CLI &cli)
                 );
             }
         }
+
+        auto control_word_text  = has_trace ? fmt::format("0x{:04X}", current.fpu_control_word) : std::string("-");
+        auto control_word_value = ftxui::text(control_word_text);
+        control_word_value      = has_trace && current.fpu_control_word != previous.fpu_control_word
+                                    ? control_word_value | ftxui::color(ftxui::Color::Yellow) | ftxui::bold
+                                    : control_word_value | ftxui::dim;
+
+        rows.emplace_back(
+            ftxui::Elements{
+                fpu_control_word_input->Render() | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, 20),
+                ftxui::text("Control word") | ftxui::bold,
+                ftxui::emptyElement(),
+                ftxui::emptyElement(),
+                has_trace ? copy_cell(control_word_value, control_word_text) : control_word_value,
+                ftxui::emptyElement(),
+            }
+        );
 
         auto table = ftxui::Table(std::move(rows));
         table.SelectAll().SeparatorVertical(ftxui::LIGHT);
@@ -2574,36 +3021,52 @@ std::int32_t run_tui(const CLI &cli)
             return false;
         }
     );
-    auto root      = ftxui::Container::Vertical({
+    auto        root = ftxui::Container::Vertical({
         code_input,
         buttons,
         flags_view,
         ftxui::Container::Horizontal({registers_view, history_view}),
     });
-    auto data_addr = fmt::format("0x{:016X}", scratch_reserve_base() + g_page_size);
+    std::string code_addr{"-"};
+    auto        data_addr = fmt::format("0x{:016X}", scratch_data_base());
 
-    // Clickable Data-address region.
-    // A left-click copies it to the clipboard.
+    // Clickable code and data base-address regions.
+    // A left-click copies the available address to the clipboard.
+    ftxui::Box code_box{};
     ftxui::Box data_box{};
 
     auto layout = ftxui::Renderer(
         root,
         [&]
         {
-            auto header        = ftxui::hbox({
+            code_addr         = ui.trace.seed[Reg::RIP] != 0 ? format_hex64_string(ui.trace.seed[Reg::RIP]) : "-";
+            auto code_element = ftxui::text(code_addr) | ftxui::bold | ftxui::reflect(code_box);
+            if (code_addr != "-")
+            {
+                code_element |= ftxui::underlined;
+            }
+
+            auto header   = ftxui::hbox({
                 ftxui::text(" Bytes ") | ftxui::bold,
                 code_input->Render() | ftxui::flex,
+                ftxui::separatorEmpty(),
+                ftxui::text("Code @ ") | ftxui::dim,
+                code_element,
                 ftxui::separatorEmpty(),
                 ftxui::text("Data @ ") | ftxui::dim,
                 ftxui::text(data_addr) | ftxui::bold | ftxui::underlined | ftxui::reflect(data_box),
                 ftxui::separatorEmpty(),
             });
-            auto controls      = ftxui::hbox({
+            auto controls = ftxui::hbox({
                 run_button->Render(),
+                ftxui::separatorEmpty(),
+                run_to_button->Render(),
                 ftxui::separatorEmpty(),
                 step_button->Render(),
                 ftxui::separatorEmpty(),
                 back_button->Render(),
+                ftxui::separatorEmpty(),
+                copy_history_button->Render(),
                 ftxui::separatorEmpty(),
                 reset_button->Render(),
                 ftxui::separatorEmpty(),
@@ -2613,14 +3076,27 @@ std::int32_t run_tui(const CLI &cli)
                 ftxui::separatorEmpty(),
                 quit_button->Render(),
             });
-            auto left          = ftxui::vbox({
+
+            ftxui::Elements left_elements{};
+            left_elements.emplace_back(
                 ftxui::window(
                     ftxui::text(" Registers "),
                     ftxui::vbox({register_toggle->Render(), ftxui::separator(), register_scroller->Render() | ftxui::flex})
                         | ftxui::reflect(registers_box)
-                ) | ftxui::flex,
-                ftxui::window(ftxui::text(" Flags "), flags_view->Render()),
-            });
+                )
+                | ftxui::flex
+            );
+
+            if (history_selection_is_static(ui))
+            {
+                left_elements.emplace_back(
+                    ftxui::text(" Static row - no execution state. Showing prior state. ") | ftxui::color(ftxui::Color::Yellow) | ftxui::bold
+                );
+            }
+
+            left_elements.emplace_back(ftxui::window(ftxui::text(" Flags "), flags_view->Render()));
+
+            auto left          = ftxui::vbox(std::move(left_elements));
             auto history_title = fmt::format(" History ({}) ", history_tab_labels[(std::size_t)ui.history_tab]);
             auto right         = ftxui::window(
                 ftxui::text(history_title),
@@ -2644,7 +3120,7 @@ std::int32_t run_tui(const CLI &cli)
     );
 
     // Layout-level events.
-    // Function-key shortcuts (`F5`/`F8`/`F7`) and the Data-address copy-click. All skipped while a modal is open.
+    // Function-key shortcuts (`F5`/`F8`/`F7`) and base-address copy clicks. All skipped while a modal is open.
     layout = ftxui::CatchEvent(
         layout,
         [&](ftxui::Event event)
@@ -2652,6 +3128,20 @@ std::int32_t run_tui(const CLI &cli)
             if (ui.show_about || ui.show_settings)
             {
                 return false;
+            }
+
+            if (event.is_mouse()
+                && event.mouse().button
+                == ftxui::Mouse::Left
+                && event.mouse().motion
+                == ftxui::Mouse::Pressed
+                && code_addr
+                != "-"
+                && code_box.Contain(event.mouse().x, event.mouse().y))
+            {
+                ui.status = copy_to_clipboard(code_addr) ? fmt::format("Copied {} to clipboard.", code_addr) : "Clipboard copy failed.";
+
+                return true;
             }
 
             if (event.is_mouse()
@@ -2783,11 +3273,23 @@ std::int32_t run_tui(const CLI &cli)
         }
     };
 
-    auto max_steps_input        = ftxui::Input(&max_steps_text, max_steps_option);
+    auto max_steps_input = ftxui::Input(&max_steps_text, max_steps_option);
+
+    ftxui::CheckboxOption address_option{};
+    address_option.on_change = [&ui]
+    {
+        if (!ui.trace.code.empty())
+        {
+            rebuild_history(ui);
+        }
+    };
+
     auto data_pointers_checkbox = ftxui::Checkbox("Seed RDI/RSI to scratch data", &ui.seed_data_pointers);
+    auto address_checkbox       = ftxui::Checkbox("Show normalized addresses", &ui.normalized_addresses, address_option);
     auto settings_close         = ftxui::Button("Close", [&ui] noexcept { ui.show_settings = false; }, ftxui::ButtonOption::Ascii());
-    auto settings_container = ftxui::Container::Vertical({syntax_button, backend_button, max_steps_input, data_pointers_checkbox, settings_close});
-    auto settings_modal     = ftxui::Renderer(
+    auto settings_container =
+        ftxui::Container::Vertical({syntax_button, backend_button, max_steps_input, data_pointers_checkbox, address_checkbox, settings_close});
+    auto settings_modal = ftxui::Renderer(
         settings_container,
         [&]
         {
@@ -2807,6 +3309,7 @@ std::int32_t run_tui(const CLI &cli)
                            max_steps_input->Render() | ftxui::inverted | ftxui::size(ftxui::WIDTH, ftxui::EQUAL, 12),
                        }),
                        data_pointers_checkbox->Render(),
+                       address_checkbox->Render(),
                        ftxui::separator(),
                        settings_close->Render() | ftxui::center,
                    })
@@ -2832,7 +3335,7 @@ std::int32_t run_tui(const CLI &cli)
 
     layout |= ftxui::Modal(settings_modal, &ui.show_settings);
 
-    if (cli.run && cli.bytes)
+    if (cli.run && (cli.bytes || cli.input_file) && !ui.code.empty())
     {
         run();
     }
@@ -2846,14 +3349,14 @@ std::int32_t run_tui(const CLI &cli)
 // JSON writes the full trace. Text prints the initial state, selected register deltas, not-reached rows, and final outcome.
 std::int32_t run_quick(const CLI &cli)
 {
-    if (!cli.bytes)
+    if (!cli.bytes && !cli.input_file)
     {
-        fmt::println(stderr, "--quick needs --bytes.");
+        fmt::println(stderr, "--quick needs --bytes or --file.");
 
         return 1;
     }
 
-    auto decoded = parse_hex(*cli.bytes);
+    auto decoded = cli.bytes ? parse_code_text(*cli.bytes) : read_binary_input(*cli.input_file);
     if (!decoded)
     {
         fmt::println(stderr, "Error: {}", decoded.error());
@@ -2865,7 +3368,7 @@ std::int32_t run_quick(const CLI &cli)
     // `CLI::parse` already validated every field strictly, so a composition failure here should be unreachable. If it happens anyway, fail loudly
     // rather than silently run with a wrong seed. `RDI`/`RSI` still default to the scratch data base when left unseeded.
     std::vector<std::string> seed_errors{};
-    auto                     seed = compose_seed(cli.seed_gpr, cli.seed_flags, cli.seed_xmm, cli.seed_st, seed_errors);
+    auto                     seed = compose_seed(cli.seed_gpr, cli.seed_flags, cli.seed_xmm, cli.seed_st, cli.seed_floating_environment, seed_errors);
     if (!seed_errors.empty())
     {
         for (auto &&error : seed_errors)
@@ -2932,6 +3435,11 @@ std::int32_t run_quick(const CLI &cli)
                 {
                     changed += fmt::format(" {}{}", (after.rflags & bit) != 0 ? '+' : '-', name);
                 }
+            }
+
+            if (((before.rflags ^ after.rflags) & RFLAGS_RESUME_FLAG) != 0)
+            {
+                changed += fmt::format(" {}RF", (after.rflags & RFLAGS_RESUME_FLAG) != 0 ? '+' : '-');
             }
 
             row("RFLAGS", format_hex64_string(before.rflags), format_hex64_string(after.rflags),

@@ -11,6 +11,15 @@ TEST(CliParse, RunWithoutBytesIsAllowed)
     EXPECT_FALSE(cli->bytes);
 }
 
+TEST(CliParse, File)
+{
+    auto cli = parse_cli({"--file", "path with spaces.bin"});
+    ASSERT_TRUE(cli);
+    EXPECT_EQ(cli->input_file.value_or(""), "path with spaces.bin");
+}
+
+TEST(CliParse, BytesAndFileAreMutuallyExclusive) { EXPECT_FALSE(parse_cli({"--bytes", "90", "--file", "code.bin"})); }
+
 TEST(CliParse, SeedFullGpr)
 {
     auto cli = parse_cli({"--bytes", "48FFC0", "--seed", "rax=10"});
@@ -27,6 +36,16 @@ TEST(CliParse, SeedSubRegisters)
 }
 
 TEST(CliParse, SeedBadHexRejected) { EXPECT_FALSE(parse_cli({"--seed", "rax=ZZ"})); }
+
+TEST(CliParse, SeedEmptyValuesRejected)
+{
+    EXPECT_FALSE(parse_cli({"--seed", "rax="}));
+    EXPECT_FALSE(parse_cli({"--seed", "cf="}));
+    EXPECT_FALSE(parse_cli({"--seed", "xmm0="}));
+    EXPECT_FALSE(parse_cli({"--seed", "st0="}));
+    EXPECT_FALSE(parse_cli({"--seed", "mxcsr="}));
+    EXPECT_FALSE(parse_cli({"--seed", "control_word="}));
+}
 
 TEST(CliParse, SeedRspRejected)
 {
@@ -51,6 +70,18 @@ TEST(CliParse, SeedSt)
     EXPECT_EQ(cli->seed_st[0], "1.5");
 }
 
+TEST(CliParse, SeedFloatingEnvironment)
+{
+    auto cli = parse_cli({"--seed", "mxcsr=5F80,control_word=27F"});
+    ASSERT_TRUE(cli);
+    EXPECT_EQ(cli->seed_floating_environment.mxcsr, "5F80");
+    EXPECT_EQ(cli->seed_floating_environment.fpu_control_word, "27F");
+}
+
+TEST(CliParse, SeedMxcsrUndefinedBitsRejected) { EXPECT_FALSE(parse_cli({"--seed", "mxcsr=10000"})); }
+
+TEST(CliParse, SeedControlWordOverflowRejected) { EXPECT_FALSE(parse_cli({"--seed", "control_word=10000"})); }
+
 TEST(CliParse, SeedFlag)
 {
     auto cli = parse_cli({"--seed", "cf=1"});
@@ -65,6 +96,8 @@ TEST(CliParse, TrackSubset)
     EXPECT_TRUE(cli->track.xmm);
     EXPECT_TRUE(cli->track.x87);
     EXPECT_FALSE(cli->track.gpr);
+    EXPECT_FALSE(cli->track.rip);
+    EXPECT_FALSE(cli->track.rflags);
 }
 
 TEST(CliParse, TrackAll)
@@ -98,6 +131,13 @@ TEST(CliParse, SyntaxAtt)
     EXPECT_EQ(cli->syntax, DisasmSyntax::ATT);
 }
 
+TEST(CliParse, SyntaxBogusRejected)
+{
+    auto cli = parse_cli({"--syntax", "bogus"});
+    ASSERT_FALSE(cli);
+    EXPECT_NE(cli.error().find("allowed options"), std::string::npos);
+}
+
 TEST(CliParse, BddisasmAttRejected) { EXPECT_FALSE(parse_cli({"--backend", "bddisasm", "--syntax", "att"})); }
 
 TEST(CliParse, BackendXed)
@@ -105,6 +145,13 @@ TEST(CliParse, BackendXed)
     auto cli = parse_cli({"--backend", "xed"});
     ASSERT_TRUE(cli);
     EXPECT_EQ(cli->backend, DisasmBackend::Xed);
+}
+
+TEST(CliParse, BackendBogusRejected)
+{
+    auto cli = parse_cli({"--backend", "xml"});
+    ASSERT_FALSE(cli);
+    EXPECT_NE(cli.error().find("allowed options"), std::string::npos);
 }
 
 TEST(CliParse, FormatDefaultsToText)
@@ -130,7 +177,12 @@ TEST(CliParse, PrettyJson)
 
 TEST(CliParse, FormatWithoutQuickRejected) { EXPECT_FALSE(parse_cli({"--format", "text"})); }
 
-TEST(CliParse, FormatBogusRejected) { EXPECT_FALSE(parse_cli({"--quick", "--format", "xml"})); }
+TEST(CliParse, FormatBogusRejected)
+{
+    auto cli = parse_cli({"--quick", "--format", "xml"});
+    ASSERT_FALSE(cli);
+    EXPECT_NE(cli.error().find("allowed options"), std::string::npos);
+}
 
 TEST(CliParse, TrackWithJsonRejected) { EXPECT_FALSE(parse_cli({"--quick", "--format", "json", "--track", "all"})); }
 
