@@ -298,7 +298,7 @@ Never run clang-format on `src/st80.asm` or `src/st80.S`.
   labeled `(end, guard)`, and other addresses within known no-access pages are labeled `(guard)`. The
   header shows the clickable absolute code base and input size, initial RSP and 64 KiB usable stack size,
   and data base and 64 KiB usable data size. Settings can switch register and History values back to
-  absolute addresses. A left-click copies raw register and header values. Shift-left-click copies the
+  absolute addresses. A left-click copies raw register and header values. Ctrl-left-click copies the
   normalized form of a full GPR or header address when available. **Copy row** copies the selected
   rendered row. The History wheel (`history_view` `CatchEvent`) steps `ui.cursor` within the active tab.
 - Tabs are GPR / SSE / x87. Buttons are Run / Run to row / Step / Back / Copy row / Reset / Settings /
