@@ -2552,7 +2552,7 @@ std::int32_t run_tui(const CLI &cli)
     std::vector<STHit> st_hits{};
 
     // Clickable register-value cells across all three panels.
-    // A left-click copies the raw value. Shift-left-click copies a normalized address when the full value points into a sandbox region.
+    // A left-click copies the raw value. Ctrl-left-click copies a normalized address when the full value points into a sandbox region.
     struct CopyHit
     {
         ftxui::Box                 box{};
@@ -3168,7 +3168,7 @@ std::int32_t run_tui(const CLI &cli)
     auto        data_size  = fmt::format(" ({} KiB)", SCRATCH_DATA_BYTES / 1024);
 
     // Clickable code, stack, and data address regions.
-    // A left-click copies the absolute address. Shift-left-click copies its normalized form.
+    // A left-click copies the absolute address. Ctrl-left-click copies its normalized form.
     ftxui::Box code_box{};
     ftxui::Box stack_box{};
     ftxui::Box data_box{};
@@ -3305,7 +3305,7 @@ std::int32_t run_tui(const CLI &cli)
                 != "-"
                 && code_box.Contain(event.mouse().x, event.mouse().y))
             {
-                auto normalized = event.mouse().shift;
+                auto normalized = event.mouse().control;
                 auto text       = normalized ? format_address_value(ui.trace, ui.trace.seed[Reg::RIP], true) : code_addr;
                 copy_value(std::move(text), normalized);
 
@@ -3321,7 +3321,7 @@ std::int32_t run_tui(const CLI &cli)
                 != "-"
                 && stack_box.Contain(event.mouse().x, event.mouse().y))
             {
-                auto normalized = event.mouse().shift;
+                auto normalized = event.mouse().control;
                 auto text       = normalized ? format_address_value(ui.trace, ui.trace.seed[Reg::RSP], true) : stack_addr;
                 copy_value(std::move(text), normalized);
 
@@ -3335,7 +3335,7 @@ std::int32_t run_tui(const CLI &cli)
                 == ftxui::Mouse::Pressed
                 && data_box.Contain(event.mouse().x, event.mouse().y))
             {
-                auto normalized = event.mouse().shift;
+                auto normalized = event.mouse().control;
                 auto text       = normalized ? format_address_value(ui.trace, scratch_data_base(), true) : data_addr;
                 copy_value(std::move(text), normalized);
 
@@ -3348,7 +3348,7 @@ std::int32_t run_tui(const CLI &cli)
                 {
                     if (hit.box.Contain(event.mouse().x, event.mouse().y))
                     {
-                        auto normalized = event.mouse().shift && hit.normalized.has_value();
+                        auto normalized = event.mouse().control && hit.normalized.has_value();
                         auto text       = normalized ? *hit.normalized : hit.text;
                         copy_value(std::move(text), normalized);
 

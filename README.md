@@ -28,7 +28,7 @@ decoders can disagree on the same bytes. Executing on real silicon (and swapping
 - Seed XMM and x87 `ST(i)` registers too, as raw hex or a decimal value (`1.5`, optional `f` for single precision or `l` for double precision), from the SSE / x87 panels or `--seed`
 - Seed MXCSR and the x87 control word as hex from the SSE / x87 panels or `--seed`
 - Guarded 64 KiB scratch stack and data regions, each with no-access pages on both sides. The header shows the absolute code base and input size, initial RSP and stack size, and usable data base and size. RDI and RSI receive the data base by default (toggle in Settings), or paste it into any seedable register
-- Click any register value (GPR, XMM, MXCSR, x87, or an individual float in a drill-down) to copy its raw value. Shift-click a full GPR or header address to copy its normalized sandbox address when available
+- Click any register value (GPR, XMM, MXCSR, x87, or an individual float in a drill-down) to copy its raw value. Ctrl-click a full GPR or header address to copy its normalized sandbox address when available
 - Copy the selected History row with **Copy row**, or rerun from the configured seed and stop before its address with **Run to row**
 - Keyboard shortcuts. **F5** run, **F8** step, **F7** back
 - Headless `--quick` output as a human-readable trace or versioned JSON with full machine state, CPU provenance, dependency revisions, and all decoder histories
