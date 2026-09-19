@@ -157,19 +157,22 @@ Never run clang-format on `src/st80.asm` or `src/st80.S`.
   (FXSAVE 1-bit/reg, not the 16-bit x87 tag word). `operator[](Reg)`.
 - `CPUFingerprint` stores process-visible CPUID identity, feature masks, XSAVE/XSTATE data, address widths, hypervisor data, and raw queried leaf/subleaf records. `host_cpu_fingerprint()` caches one immutable process snapshot shared by traces. `CPUQuerySource` makes collection deterministic in tests.
 - `ExecutionEvent` stores only CPU execution state: RIP, the full register snapshot, and completed/faulted classification. It has no decoder text or instruction-length fields. Fault-time RFLAGS preserves processor exception-delivery changes such as RF being set for fault-class exceptions.
-- `Trace` separates the request (`code`, requested seed/backend/syntax, effective step cap, scratch-pointer policy), recorded execution (`seed`, raw `execution_events`), host CPU fingerprint, and outcome. `Outcome::Error` identifies engine or instrumentation failure, while `Outcome::Faulted` identifies a fault raised by supplied bytes. `stop_reason` records why execution halted and labels stop, fault, or not-reached rows where applicable. `stop_address` anchors an `int3`, fault, or selected-row stop.
+- `Trace` separates the request (`code`, requested seed/backend/syntax, effective step cap, scratch-pointer policy), recorded execution (`seed`, raw `execution_events`), host CPU fingerprint, and outcome. `Outcome::Error` identifies engine or instrumentation failure, while `Outcome::Faulted` identifies a fault raised by supplied bytes. `stop_reason` records why execution halted and labels stop, fault, or not-reached rows where applicable. `stop_address` is the instruction address for an `int3`, fault, or selected-row stop. Memory faults separately retain the operand address when the OS provides it and a read, write, execute, or unknown access classification.
 - `build_history` overlays one decoder's instruction boundaries on immutable trace code and execution events. Static rows stop before every execution-event start, even when a decoder's linear instruction would cross that later entry point. `HistoryRow` maps reached and faulted rows back through `execution_event_index` without copying register snapshots. Multiple backend histories can coexist without mutating `Trace`.
-- `write_trace_json` streams compact or two-space-indented schema version 1 JSON through the Glaze-only `bme_serializer` translation unit. The document includes producer and dependency revisions, host and CPU provenance, request state, full execution snapshots, outcome, and all four decoder histories. Integer machine state uses fixed-width hexadecimal strings. Stable unavailable values use `null`. The writer appends one newline and reports serialization or stream failures.
+- `write_trace_json` streams compact or two-space-indented schema version 1 JSON through the Glaze-only `bme_serializer` translation unit. The document includes producer and dependency revisions, host and CPU provenance, request state, full execution snapshots, outcome, optional fault-memory metadata, and all four decoder histories. Integer machine state uses fixed-width hexadecimal strings. Stable unavailable values use `null`. The writer appends one newline and reports serialization or stream failures.
 - Platform execution lives behind the private `os.hpp` contract. `os.cpp` handles shared preflight,
   including copying the requested seed and refusing execution when instrumentation is detected.
   Windows uses guarded `VirtualAlloc` mappings and a VEH sandbox thread. Linux uses guarded `mmap`
   mappings and a traced child with `PTRACE_SINGLESTEP`, `PTRACE_O_EXITKILL`, and `PTRACE_GETFPREGS`.
-  Both platforms use guarded 64 KiB scratch stack and data regions. The data mapping reserves at
-  `SCRATCH_DATA_RESERVE_BASE`, never relocates, and exposes usable bytes one guard page above it.
-  RDI and RSI default to that usable address unless seeded. An optional stop offset is resolved against
-  each run's code base and checked after every completed step without patching the input. The step cap
-  defaults to 50k and clamps to `MAX_STEPS_LIMIT`, but it does not bound wall-clock time. A blocking
-  system call can stall a run.
+  For `SIGSEGV` and `SIGBUS`, Linux reinjects the original signal into a one-shot handler on a guarded
+  alternate stack. A dedicated pipe returns `si_addr` plus the x86 trap number and error code. Only page
+  faults are classified as read, write, or execute. Missing or malformed reports remain unknown after a
+  bounded wait. Both platforms place no-access pages on both sides of the usable 64 KiB scratch stack and
+  data regions. The data mapping reserves at `SCRATCH_DATA_RESERVE_BASE`, never relocates, and exposes
+  usable bytes one guard page above it. RDI and RSI default to that usable address unless seeded. An
+  optional stop offset is resolved against each run's code base and checked after every completed step
+  without patching the input. The step cap defaults to 50k and clamps to `MAX_STEPS_LIMIT`, but it does
+  not bound wall-clock time. A blocking system call can stall a run.
 - Linux asks Zydis to identify software-breakpoint instructions only after ptrace reports a breakpoint-class `SIGTRAP`. This avoids handwritten x86 parsing and distinguishes WSL2's ambiguous syscall completion trap. The runtime check does not use the selected display backend.
 - `parse_code_text` accepts contiguous or whitespace-separated hex, `\xNN` escapes, and `{ 0xNN, ... }` byte arrays. `--file` reads up to 15,000,000 exact bytes from a raw binary file. It never infers a text encoding. `--bytes` and `--file` are mutually exclusive.
 - Decode backends (`DisasmBackend`). `disasm_one(backend, syntax, addr, code, size)` -> `Decoded`
@@ -290,10 +293,14 @@ Never run clang-format on `src/st80.asm` or `src/st80.S`.
   incrementing the executed count. Instruction-fetch fault addresses outside `Trace::code` are not decoded
   as history rows. Switching tabs preserves the selected state or byte address even when decoder boundaries
   differ. Reached rows render normally, faults in red, stop rows emphasized, and static rows dimmed.
-  Code and scratch-data addresses use `code+offset` and `data+offset` forms by default. The header shows
-  clickable absolute code and data bases, while Settings can switch register and History values back to
-  absolute addresses. **Copy row** copies the selected rendered row. The History wheel (`history_view`
-  `CatchEvent`) steps `ui.cursor` within the active tab.
+  Code, scratch-stack, and scratch-data addresses use `code+offset`, `stack+offset`, and `data+offset`
+  forms by default. Stack offsets are relative to the initial RSP. Exact one-past-end addresses are
+  labeled `(end, guard)`, and other addresses within known no-access pages are labeled `(guard)`. The
+  header shows the clickable absolute code base and input size, initial RSP and 64 KiB usable stack size,
+  and data base and 64 KiB usable data size. Settings can switch register and History values back to
+  absolute addresses. A left-click copies raw register and header values. Shift-left-click copies the
+  normalized form of a full GPR or header address when available. **Copy row** copies the selected
+  rendered row. The History wheel (`history_view` `CatchEvent`) steps `ui.cursor` within the active tab.
 - Tabs are GPR / SSE / x87. Buttons are Run / Run to row / Step / Back / Copy row / Reset / Settings /
   About / Quit. **Run to row** reruns from the configured seed and stops before the selected byte offset.
   Keyboard `F5`/`F8`/`F7` runs, steps, and backs. Layout shortcuts are suppressed while a modal is open.

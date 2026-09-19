@@ -12,6 +12,7 @@ enum class VMProtection : std::uint8_t
 };
 
 constexpr std::size_t      SCRATCH_STACK_BYTES       = 0x10000;
+constexpr std::size_t      SCRATCH_STACK_HEADROOM    = 0x100;
 constexpr std::size_t      SCRATCH_DATA_BYTES        = 0x10000;
 constexpr std::uint64_t    SCRATCH_DATA_RESERVE_BASE = 0x1000'0000;
 constexpr std::string_view INSTRUMENTATION_REFUSAL = "Running under an emulator or instrumentation layer. Native single-step tracing is unavailable.";
@@ -71,12 +72,14 @@ struct PlatformRunResult
     std::vector<PlatformStep> steps{};
 
     // Outcome.
-    Outcome       outcome = Outcome::Finished;
-    bool          instrumentation_detected{};
-    std::string   fault_name{};
-    std::string   error{};
-    std::uint64_t stop_address{};
-    bool          stopped_at_target{};
+    Outcome                      outcome = Outcome::Finished;
+    bool                         instrumentation_detected{};
+    std::string                  fault_name{};
+    std::string                  error{};
+    std::uint64_t                stop_address{};
+    std::optional<std::uint64_t> fault_memory_address{};
+    FaultAccess                  fault_access = FaultAccess::None;
+    bool                         stopped_at_target{};
 };
 
 bool prepare_platform_run(const PlatformRunRequest &request, PlatformRunResult &result);

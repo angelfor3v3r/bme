@@ -50,12 +50,14 @@ struct Engine
     bool          active{};
 
     // Captured execution result.
-    std::vector<RawStep> raw_steps{};
-    Outcome              outcome = Outcome::Finished;
-    DWORD                fault_code{};
-    std::uint64_t        fault_address{};
-    Registers            fault_registers{};
-    bool                 stopped_at_target{};
+    std::vector<RawStep>         raw_steps{};
+    Outcome                      outcome = Outcome::Finished;
+    DWORD                        fault_code{};
+    std::uint64_t                fault_address{};
+    std::optional<std::uint64_t> fault_memory_address{};
+    FaultAccess                  fault_access = FaultAccess::None;
+    Registers                    fault_registers{};
+    bool                         stopped_at_target{};
 };
 
 std::unique_ptr<Engine> g_engine{};
@@ -500,9 +502,23 @@ LONG CALLBACK bme_veh(EXCEPTION_POINTERS *exception_pointers) noexcept
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
+    auto *exception_record  = exception_pointers->ExceptionRecord;
     g_engine->outcome       = Outcome::Faulted;
     g_engine->fault_code    = exc_code;
-    g_engine->fault_address = (std::uint64_t)exception_pointers->ExceptionRecord->ExceptionAddress;
+    g_engine->fault_address = (std::uint64_t)exception_record->ExceptionAddress;
+
+    if ((exc_code == EXCEPTION_ACCESS_VIOLATION || exc_code == EXCEPTION_IN_PAGE_ERROR) && exception_record->NumberParameters >= 2)
+    {
+        g_engine->fault_memory_address = exception_record->ExceptionInformation[1];
+
+        switch (exception_record->ExceptionInformation[0])
+        {
+        case 0:  g_engine->fault_access = FaultAccess::Read; break;
+        case 1:  g_engine->fault_access = FaultAccess::Write; break;
+        case 8:  g_engine->fault_access = FaultAccess::Execute; break;
+        default: g_engine->fault_access = FaultAccess::Unknown; break;
+        }
+    }
 
     g_engine->snapshot(context, g_engine->fault_registers);
 
@@ -524,13 +540,13 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     auto  page_size   = vm_page_size();
     auto  code_region = request.code.size() + page_size - 1 & ~(page_size - 1);
     auto *buffer      = (std::uint8_t *)vm_alloc(code_region + page_size);
-    auto *stack       = (std::uint8_t *)vm_alloc(SCRATCH_STACK_BYTES + page_size);
+    auto *stack       = (std::uint8_t *)vm_alloc(SCRATCH_STACK_BYTES + (page_size * 2));
     auto *data        = (std::uint8_t *)vm_alloc_at(scratch_reserve_base(), SCRATCH_DATA_BYTES + (page_size * 2));
 
     auto release_regions = [&buffer, &stack, &data, code_region, page_size]() noexcept
     {
         vm_free(buffer, code_region + page_size);
-        vm_free(stack, SCRATCH_STACK_BYTES + page_size);
+        vm_free(stack, SCRATCH_STACK_BYTES + (page_size * 2));
         vm_free(data, SCRATCH_DATA_BYTES + (page_size * 2));
     };
 
@@ -570,7 +586,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
         return fail("FlushInstructionCache failed.");
     }
 
-    auto initial_rsp   = (std::uint64_t)(stack + page_size + SCRATCH_STACK_BYTES - 0x100) & ~(std::uint64_t)15;
+    auto initial_rsp   = (std::uint64_t)(stack + page_size + SCRATCH_STACK_BYTES - SCRATCH_STACK_HEADROOM) & ~(std::uint64_t)15;
     auto data_base     = (std::uint64_t)(data + page_size);
     auto effective_rdi = request.seed_data_pointers && request.seed[Reg::RDI] == 0 ? data_base : request.seed[Reg::RDI];
     auto effective_rsi = request.seed_data_pointers && request.seed[Reg::RSI] == 0 ? data_base : request.seed[Reg::RSI];
@@ -758,9 +774,11 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
         step.faulted   = true;
     }
 
-    result.outcome           = g_engine->outcome;
-    result.stop_address      = g_engine->fault_address;
-    result.stopped_at_target = g_engine->stopped_at_target;
+    result.outcome              = g_engine->outcome;
+    result.stop_address         = g_engine->fault_address;
+    result.fault_memory_address = g_engine->fault_memory_address;
+    result.fault_access         = g_engine->fault_access;
+    result.stopped_at_target    = g_engine->stopped_at_target;
 
     if (g_engine->outcome == Outcome::Faulted)
     {

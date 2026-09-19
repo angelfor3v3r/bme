@@ -1259,20 +1259,101 @@ Decoded disasm_one(DisasmBackend backend, DisasmSyntax syntax, std::uint64_t add
     return result;
 }
 
+std::string_view fault_access_action(FaultAccess access) noexcept
+{
+    switch (access)
+    {
+    case FaultAccess::Read:    return "reading";
+    case FaultAccess::Write:   return "writing";
+    case FaultAccess::Execute: return "executing";
+    default:                   return "accessing";
+    }
+}
+
 auto format_address_value(const Trace &trace, std::uint64_t address, bool normalized)
 {
     if (normalized)
     {
+        static auto page_size = vm_page_size();
+
         auto code_base = trace.seed[Reg::RIP];
-        if (code_base != 0 && address >= code_base && address - code_base < trace.code.size())
+        if (code_base != 0 && !trace.code.empty() && address >= code_base)
         {
-            return fmt::format("code+{:04X}", address - code_base);
+            auto code_offset = address - code_base;
+            if (code_offset < trace.code.size())
+            {
+                return fmt::format("code+{:04X}", code_offset);
+            }
+
+            if (code_offset == trace.code.size())
+            {
+                return fmt::format("code+{:04X} (end, guard)", code_offset);
+            }
+
+            if (code_offset < trace.code.size() + page_size)
+            {
+                return fmt::format("code+{:04X} (guard)", code_offset);
+            }
+        }
+
+        auto stack_pointer = trace.seed[Reg::RSP];
+        if (stack_pointer != 0)
+        {
+            if (address >= stack_pointer)
+            {
+                auto stack_offset = address - stack_pointer;
+                if (stack_offset < SCRATCH_STACK_HEADROOM)
+                {
+                    return fmt::format("stack+{:04X}", stack_offset);
+                }
+
+                if (stack_offset == SCRATCH_STACK_HEADROOM)
+                {
+                    return fmt::format("stack+{:04X} (end, guard)", stack_offset);
+                }
+
+                if (stack_offset < SCRATCH_STACK_HEADROOM + page_size)
+                {
+                    return fmt::format("stack+{:04X} (guard)", stack_offset);
+                }
+            }
+            else
+            {
+                auto stack_offset = stack_pointer - address;
+                if (stack_offset <= SCRATCH_STACK_BYTES - SCRATCH_STACK_HEADROOM)
+                {
+                    return fmt::format("stack-{:04X}", stack_offset);
+                }
+
+                if (stack_offset <= SCRATCH_STACK_BYTES - SCRATCH_STACK_HEADROOM + page_size)
+                {
+                    return fmt::format("stack-{:04X} (guard)", stack_offset);
+                }
+            }
         }
 
         auto data_base = scratch_data_base();
-        if (address >= data_base && address - data_base < SCRATCH_DATA_BYTES)
+        if (address >= data_base)
         {
-            return fmt::format("data+{:04X}", address - data_base);
+            auto data_offset = address - data_base;
+            if (data_offset < SCRATCH_DATA_BYTES)
+            {
+                return fmt::format("data+{:04X}", data_offset);
+            }
+
+            if (data_offset == SCRATCH_DATA_BYTES)
+            {
+                return fmt::format("data+{:04X} (end, guard)", data_offset);
+            }
+
+            if (data_offset < SCRATCH_DATA_BYTES + page_size)
+            {
+                return fmt::format("data+{:04X} (guard)", data_offset);
+            }
+        }
+        else if (data_base - address <= page_size)
+        {
+            return fmt::format("data-{:04X} (guard)", data_base - address);
         }
     }
 
@@ -1429,6 +1510,8 @@ Trace run_engine(
     trace.seed                     = result.seed;
     trace.outcome                  = result.outcome;
     trace.instrumentation_detected = result.instrumentation_detected;
+    trace.fault_memory_address     = result.fault_memory_address;
+    trace.fault_access             = result.fault_access;
 
     if (result.instrumentation_detected)
     {
@@ -1482,7 +1565,17 @@ Trace run_engine(
 
     case Outcome::Faulted:
     {
-        trace.message      = fmt::format("{} at 0x{:X} ({} executed).", result.fault_name, result.stop_address, executed);
+        std::string memory_detail{};
+        if (result.fault_memory_address)
+        {
+            auto absolute   = format_hex64_string(*result.fault_memory_address);
+            auto normalized = format_address_value(trace, *result.fault_memory_address, true);
+            auto memory     = normalized == absolute ? absolute : fmt::format("{} ({})", absolute, normalized);
+
+            memory_detail = fmt::format(" while {} {}", fault_access_action(result.fault_access), memory);
+        }
+
+        trace.message      = fmt::format("{} at 0x{:X}{} ({} executed).", result.fault_name, result.stop_address, memory_detail, executed);
         trace.stop_reason  = fmt::format("Faulted here - {}", result.fault_name);
         trace.stop_address = result.stop_address;
 
@@ -2105,6 +2198,25 @@ std::int32_t run_tui(const CLI &cli)
     code_option.multiline   = false;
     code_option.placeholder = "Hex bytes, e.g. 48 FF C0";
     code_option.on_enter    = run;
+    code_option.transform   = [](ftxui::InputState state)
+    {
+        if (state.is_placeholder)
+        {
+            state.element |= ftxui::dim;
+        }
+
+        state.element |= ftxui::inverted;
+        if (state.focused)
+        {
+            state.element |= ftxui::bold;
+        }
+        else if (state.hovered)
+        {
+            state.element |= ftxui::underlined;
+        }
+
+        return state.element;
+    };
 
     auto code_input = ftxui::Input(&ui.code, code_option);
 
@@ -2440,18 +2552,19 @@ std::int32_t run_tui(const CLI &cli)
     std::vector<STHit> st_hits{};
 
     // Clickable register-value cells across all three panels.
-    // A left-click copies the raw value to the clipboard.
+    // A left-click copies the raw value. Shift-left-click copies a normalized address when the full value points into a sandbox region.
     struct CopyHit
     {
-        ftxui::Box  box{};
-        std::string text{};
+        ftxui::Box                 box{};
+        std::string                text{};
+        std::optional<std::string> normalized{};
     };
 
     std::vector<CopyHit> copy_hits{};
 
-    auto copy_cell = [&copy_hits](const ftxui::Element &cell, std::string text)
+    auto copy_cell = [&copy_hits](const ftxui::Element &cell, std::string text, std::optional<std::string> normalized = {})
     {
-        copy_hits.emplace_back(CopyHit{.text = std::move(text)});
+        copy_hits.emplace_back(CopyHit{.text = std::move(text), .normalized = std::move(normalized)});
 
         return cell | ftxui::reflect(copy_hits.back().box);
     };
@@ -2496,8 +2609,19 @@ std::int32_t run_tui(const CLI &cli)
                 auto text      = has_trace ? (reg == Reg::RFLAGS ? copy_text : format_address_value(ui.trace, current[reg], ui.normalized_addresses))
                                            : std::string("-");
                 auto val       = make_value(text, current[reg] != previous[reg]);
+                std::optional<std::string> normalized_copy{};
+                if (has_trace && reg != Reg::RFLAGS)
+                {
+                    normalized_copy = format_address_value(ui.trace, current[reg], true);
+                    if (*normalized_copy == copy_text)
+                    {
+                        normalized_copy.reset();
+                    }
+                }
 
-                rows.emplace_back(ftxui::Elements{ftxui::emptyElement(), name, has_trace ? copy_cell(val, copy_text) : val});
+                rows.emplace_back(
+                    ftxui::Elements{ftxui::emptyElement(), name, has_trace ? copy_cell(val, copy_text, std::move(normalized_copy)) : val}
+                );
 
                 continue;
             }
@@ -2526,8 +2650,17 @@ std::int32_t run_tui(const CLI &cli)
                 auto copy_text = has_trace ? fmt::format("0x{:0{}X}", value, hex_digits) : std::string("-");
                 auto text = has_trace ? (level == 0 ? format_address_value(ui.trace, value, ui.normalized_addresses) : copy_text) : std::string("-");
                 auto val  = make_value(text, value != prev_value);
+                std::optional<std::string> normalized_copy{};
+                if (has_trace && level == 0)
+                {
+                    normalized_copy = format_address_value(ui.trace, value, true);
+                    if (*normalized_copy == copy_text)
+                    {
+                        normalized_copy.reset();
+                    }
+                }
 
-                rows.emplace_back(ftxui::Elements{seed, name, has_trace ? copy_cell(val, copy_text) : val});
+                rows.emplace_back(ftxui::Elements{seed, name, has_trace ? copy_cell(val, copy_text, std::move(normalized_copy)) : val});
             };
 
             emit(0, REG_NAMES[i], full, prev, 16, seed_inputs[i].full);
@@ -3021,43 +3154,67 @@ std::int32_t run_tui(const CLI &cli)
             return false;
         }
     );
-    auto        root = ftxui::Container::Vertical({
+    auto        root      = ftxui::Container::Vertical({
         code_input,
         buttons,
         flags_view,
         ftxui::Container::Horizontal({registers_view, history_view}),
     });
-    std::string code_addr{"-"};
-    auto        data_addr = fmt::format("0x{:016X}", scratch_data_base());
+    std::string code_addr = "-";
+    std::string code_size{};
+    std::string stack_addr = "-";
+    auto        stack_size = fmt::format(" (Stack {} KiB)", SCRATCH_STACK_BYTES / 1024);
+    auto        data_addr  = fmt::format("0x{:016X}", scratch_data_base());
+    auto        data_size  = fmt::format(" ({} KiB)", SCRATCH_DATA_BYTES / 1024);
 
-    // Clickable code and data base-address regions.
-    // A left-click copies the available address to the clipboard.
+    // Clickable code, stack, and data address regions.
+    // A left-click copies the absolute address. Shift-left-click copies its normalized form.
     ftxui::Box code_box{};
+    ftxui::Box stack_box{};
     ftxui::Box data_box{};
 
     auto layout = ftxui::Renderer(
         root,
         [&]
         {
-            code_addr         = ui.trace.seed[Reg::RIP] != 0 ? format_hex64_string(ui.trace.seed[Reg::RIP]) : "-";
-            auto code_element = ftxui::text(code_addr) | ftxui::bold | ftxui::reflect(code_box);
+            code_addr  = ui.trace.seed[Reg::RIP] != 0 ? format_hex64_string(ui.trace.seed[Reg::RIP]) : "-";
+            stack_addr = ui.trace.seed[Reg::RSP] != 0 ? format_hex64_string(ui.trace.seed[Reg::RSP]) : "-";
+            code_size  = ui.trace.code.empty() ? "" : fmt::format(" ({} B)", ui.trace.code.size());
+
+            auto code_element  = ftxui::text(code_addr) | ftxui::bold | ftxui::reflect(code_box);
+            auto stack_element = ftxui::text(stack_addr) | ftxui::bold | ftxui::reflect(stack_box);
             if (code_addr != "-")
             {
                 code_element |= ftxui::underlined;
             }
 
-            auto header   = ftxui::hbox({
+            if (stack_addr != "-")
+            {
+                stack_element |= ftxui::underlined;
+            }
+
+            auto bytes_row   = ftxui::hbox({
                 ftxui::text(" Bytes ") | ftxui::bold,
                 code_input->Render() | ftxui::flex,
-                ftxui::separatorEmpty(),
-                ftxui::text("Code @ ") | ftxui::dim,
+            });
+            auto address_row = ftxui::hbox({
+                ftxui::text(" Code @ ") | ftxui::dim,
                 code_element,
+                ftxui::text(code_size) | ftxui::dim,
+                ftxui::separatorEmpty(),
+                ftxui::separatorLight(),
+                ftxui::separatorEmpty(),
+                ftxui::text("RSP @ ") | ftxui::dim,
+                stack_element,
+                ftxui::text(stack_size) | ftxui::dim,
+                ftxui::separatorEmpty(),
+                ftxui::separatorLight(),
                 ftxui::separatorEmpty(),
                 ftxui::text("Data @ ") | ftxui::dim,
                 ftxui::text(data_addr) | ftxui::bold | ftxui::underlined | ftxui::reflect(data_box),
-                ftxui::separatorEmpty(),
+                ftxui::text(data_size) | ftxui::dim,
             });
-            auto controls = ftxui::hbox({
+            auto controls    = ftxui::hbox({
                 run_button->Render(),
                 ftxui::separatorEmpty(),
                 run_to_button->Render(),
@@ -3111,7 +3268,9 @@ std::int32_t run_tui(const CLI &cli)
                     : ftxui::emptyElement();
 
             return ftxui::vbox({
-                ftxui::window(ftxui::text(" BME - Bare metal machine code viewer "), ftxui::vbox({header, ftxui::separator(), controls})),
+                ftxui::window(
+                    ftxui::text(" BME - Bare metal machine code viewer "), ftxui::vbox({bytes_row, address_row, ftxui::separator(), controls})
+                ),
                 body,
                 instrumentation_warning,
                 ftxui::text(' ' + ui.status) | ftxui::dim,
@@ -3120,7 +3279,7 @@ std::int32_t run_tui(const CLI &cli)
     );
 
     // Layout-level events.
-    // Function-key shortcuts (`F5`/`F8`/`F7`) and base-address copy clicks. All skipped while a modal is open.
+    // Function-key shortcuts (`F5`/`F8`/`F7`) and address copy clicks. All skipped while a modal is open.
     layout = ftxui::CatchEvent(
         layout,
         [&](ftxui::Event event)
@@ -3129,6 +3288,13 @@ std::int32_t run_tui(const CLI &cli)
             {
                 return false;
             }
+
+            auto copy_value = [&ui](std::string text, bool normalized)
+            {
+                auto copied = copy_to_clipboard(text);
+                auto kind   = normalized ? "normalized address" : "value";
+                ui.status   = copied ? fmt::format("Copied {} {} to clipboard.", kind, text) : "Clipboard copy failed.";
+            };
 
             if (event.is_mouse()
                 && event.mouse().button
@@ -3139,7 +3305,25 @@ std::int32_t run_tui(const CLI &cli)
                 != "-"
                 && code_box.Contain(event.mouse().x, event.mouse().y))
             {
-                ui.status = copy_to_clipboard(code_addr) ? fmt::format("Copied {} to clipboard.", code_addr) : "Clipboard copy failed.";
+                auto normalized = event.mouse().shift;
+                auto text       = normalized ? format_address_value(ui.trace, ui.trace.seed[Reg::RIP], true) : code_addr;
+                copy_value(std::move(text), normalized);
+
+                return true;
+            }
+
+            if (event.is_mouse()
+                && event.mouse().button
+                == ftxui::Mouse::Left
+                && event.mouse().motion
+                == ftxui::Mouse::Pressed
+                && stack_addr
+                != "-"
+                && stack_box.Contain(event.mouse().x, event.mouse().y))
+            {
+                auto normalized = event.mouse().shift;
+                auto text       = normalized ? format_address_value(ui.trace, ui.trace.seed[Reg::RSP], true) : stack_addr;
+                copy_value(std::move(text), normalized);
 
                 return true;
             }
@@ -3151,7 +3335,9 @@ std::int32_t run_tui(const CLI &cli)
                 == ftxui::Mouse::Pressed
                 && data_box.Contain(event.mouse().x, event.mouse().y))
             {
-                ui.status = copy_to_clipboard(data_addr) ? fmt::format("Copied {} to clipboard.", data_addr) : "Clipboard copy failed.";
+                auto normalized = event.mouse().shift;
+                auto text       = normalized ? format_address_value(ui.trace, scratch_data_base(), true) : data_addr;
+                copy_value(std::move(text), normalized);
 
                 return true;
             }
@@ -3162,7 +3348,9 @@ std::int32_t run_tui(const CLI &cli)
                 {
                     if (hit.box.Contain(event.mouse().x, event.mouse().y))
                     {
-                        ui.status = copy_to_clipboard(hit.text) ? fmt::format("Copied {} to clipboard.", hit.text) : "Clipboard copy failed.";
+                        auto normalized = event.mouse().shift && hit.normalized.has_value();
+                        auto text       = normalized ? *hit.normalized : hit.text;
+                        copy_value(std::move(text), normalized);
 
                         return true;
                     }

@@ -7,7 +7,8 @@ Nothing here blocks the current release. Future improvements are ordered roughly
 - Floating-point environment seeds for `MXCSR` and the x87 `control_word`, including host-mask validation on Windows and Linux
 - Raw binary input through `--file`, with exact byte semantics and no text-format inference
 - Formatted `--bytes` input for contiguous or whitespace-separated hex, `\xNN` escapes, and `{ 0xNN, ... }` byte arrays
-- Clear History state styling, selected-row clipboard copying, and normalized `code+offset` / `data+offset` addresses with visible absolute bases
+- Clear History state styling, selected-row clipboard copying, and normalized code, stack, data, end, and guard addresses with visible absolute bases
+- Symmetric scratch guard pages, OS-reported memory-fault addresses, and read, write, or execute classification for Windows access violations and Linux x86 page faults
 - **Run to row**, which reruns from the configured seed and checks the selected byte offset after every single step without patching the input
 
 ## Highest-value features
@@ -37,6 +38,14 @@ Registers alone are insufficient for investigating load and store instructions. 
 
 Do not retain a complete 64 KiB snapshot for every step. At the maximum step count, that could consume gigabytes. Record changed ranges, dirty pages, or only initial and final memory until an efficient per-step design exists.
 
+### Corpus replay and trace comparison
+
+Add a bounded headless corpus runner that accepts explicit byte cases and writes one trace record per case. It should support resumable runs and reuse the normal engine, provenance, decoder histories, and limits rather than creating a second execution path.
+
+Add a trace comparator that checks captures from different CPUs, operating systems, or BME builds and reports the first divergent execution event, register, flag, fault, or decoder boundary. Keep raw traces immutable and make comparisons a separate operation.
+
+This provides immediate multi-machine differential analysis and a reusable execution layer for the eventual fuzzer.
+
 ### Windows worker-process execution
 
 Windows currently executes supplied bytes in a thread within BME's process. Moving execution to a worker process would permit:
@@ -52,16 +61,9 @@ The Linux traced-child design already provides much of this isolation. This shou
 
 ## Smaller improvements
 
-### Scratch stack address normalization
+### Repeated-history folding
 
-Code and scratch-data pointers now use stable `code+offset` and `data+offset` forms by default. Extend the same display to addresses within the sandbox stack:
-
-```text
-stack-0028
-```
-
-The stack anchor must remain meaningful across captured states and both platform backends.
-
+Optionally fold adjacent executions of the same instruction address in the TUI so bounded loops remain navigable. Expansion must recover every event, and JSON must preserve the uncompressed timeline.
 
 ## Larger future work
 
@@ -114,7 +116,7 @@ A dedicated differential harness is the long-term payoff:
 - Reproduction artifact output
 - Resumable corpus storage
 
-Build the divergence comparison on the existing machine-readable trace schema so the fuzzer consumes the same stable execution and decoder records.
+Build it on the decoder-divergence model, corpus runner, trace comparator, and existing machine-readable trace schema so interactive and automated analysis share the same records.
 
 ## Deferred ideas
 
@@ -132,9 +134,10 @@ These currently offer little value relative to their complexity:
 
 1. Decoder divergence summary
 2. Scratch-memory inspection
-3. Trace import and inspection
-4. Crash-dump parsing and context extraction
-5. Crash-dump navigation and replay setup
-6. Windows worker process and wall-clock cancellation
-7. XSAVE-based modern SIMD state
-8. Dedicated fuzzer
+3. Corpus replay and trace comparison
+4. Trace import and inspection
+5. Crash-dump parsing and context extraction
+6. Crash-dump navigation and replay setup
+7. Windows worker process and wall-clock cancellation
+8. XSAVE-based modern SIMD state
+9. Dedicated fuzzer

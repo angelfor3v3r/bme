@@ -14,11 +14,13 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 namespace bme
@@ -35,6 +37,7 @@ enum class ChildError : std::uint8_t
     Commit,
     Protect,
     Flush,
+    SignalSetup,
 };
 
 struct ChildReady
@@ -44,6 +47,20 @@ struct ChildReady
     std::uint64_t data_base{};
     ChildError    error{};
 };
+
+struct FaultReport
+{
+    std::uint64_t address{};
+    std::uint64_t error_code{};
+    std::int32_t  trap_number{};
+};
+
+constexpr std::int32_t  PAGE_FAULT_TRAP         = 14;
+constexpr std::uint64_t PAGE_FAULT_WRITE        = 1ull << 1;
+constexpr std::uint64_t PAGE_FAULT_INSTRUCTION  = 1ull << 4;
+constexpr std::int32_t  FAULT_REPORT_TIMEOUT_MS = 1000;
+
+volatile sig_atomic_t g_fault_report_descriptor = -1;
 
 bool write_all(int descriptor, const void *buffer, std::size_t size) noexcept
 {
@@ -70,6 +87,19 @@ bool write_all(int descriptor, const void *buffer, std::size_t size) noexcept
     return true;
 }
 
+void fault_report_handler([[maybe_unused]] int signal_number, siginfo_t *signal_info, void *context) noexcept
+{
+    auto       *ucontext = (ucontext_t *)context;
+    FaultReport report{
+        .address     = (std::uint64_t)signal_info->si_addr,
+        .error_code  = (std::uint64_t)ucontext->uc_mcontext.gregs[REG_ERR],
+        .trap_number = (std::int32_t)ucontext->uc_mcontext.gregs[REG_TRAPNO],
+    };
+
+    write_all(g_fault_report_descriptor, &report, sizeof(report));
+    _exit(0);
+}
+
 bool read_all(int descriptor, void *buffer, std::size_t size) noexcept
 {
     auto *bytes = (std::uint8_t *)buffer;
@@ -93,6 +123,42 @@ bool read_all(int descriptor, void *buffer, std::size_t size) noexcept
     }
 
     return true;
+}
+
+FaultAccess classify_fault_access(const FaultReport &report, std::uint64_t expected_address) noexcept
+{
+    if (report.address != expected_address || report.trap_number != PAGE_FAULT_TRAP)
+    {
+        return FaultAccess::Unknown;
+    }
+
+    if ((report.error_code & PAGE_FAULT_INSTRUCTION) != 0)
+    {
+        return FaultAccess::Execute;
+    }
+
+    return (report.error_code & PAGE_FAULT_WRITE) != 0 ? FaultAccess::Write : FaultAccess::Read;
+}
+
+bool collect_fault_report(pid_t child, int descriptor, int signal, FaultReport &report) noexcept
+{
+    if (ptrace(PTRACE_CONT, child, nullptr, (void *)(std::intptr_t)signal) == -1)
+    {
+        return false;
+    }
+
+    pollfd poll_descriptor{
+        .fd      = descriptor,
+        .events  = POLLIN,
+        .revents = 0,
+    };
+    auto poll_result = poll(&poll_descriptor, 1, FAULT_REPORT_TIMEOUT_MS);
+    if (poll_result <= 0 || (poll_descriptor.revents & POLLIN) == 0)
+    {
+        return false;
+    }
+
+    return read(descriptor, &report, sizeof(report)) == (ssize_t)sizeof(report);
 }
 
 bool wait_for_child(pid_t child, int &status) noexcept
@@ -197,37 +263,43 @@ void initialize_fpu() noexcept
                    "xmm14", "xmm15");
 }
 
-void child_main(const PlatformRunRequest &request, int ready_descriptor, std::size_t page_size, std::uint64_t data_reserve_base) noexcept
+void child_main(
+    const PlatformRunRequest &request, int report_descriptor, std::size_t page_size, std::size_t signal_stack_size, std::uint64_t data_reserve_base
+) noexcept
 {
+    g_fault_report_descriptor = report_descriptor;
+
     ChildReady ready{};
     if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) == -1)
     {
         ready.error = ChildError::Trace;
 
-        write_all(ready_descriptor, &ready, sizeof(ready));
+        write_all(report_descriptor, &ready, sizeof(ready));
         _exit(1);
     }
 
-    auto  code_region = (request.code.size() + page_size - 1) & ~(page_size - 1);
-    auto *buffer      = (std::uint8_t *)vm_alloc(code_region + page_size);
-    auto *stack       = (std::uint8_t *)vm_alloc(SCRATCH_STACK_BYTES + page_size);
-    auto *data        = (std::uint8_t *)vm_alloc_at(data_reserve_base, SCRATCH_DATA_BYTES + (page_size * 2));
-    if (buffer == nullptr || stack == nullptr || data == nullptr)
+    auto  code_region  = (request.code.size() + page_size - 1) & ~(page_size - 1);
+    auto *buffer       = (std::uint8_t *)vm_alloc(code_region + page_size);
+    auto *stack        = (std::uint8_t *)vm_alloc(SCRATCH_STACK_BYTES + (page_size * 2));
+    auto *data         = (std::uint8_t *)vm_alloc_at(data_reserve_base, SCRATCH_DATA_BYTES + (page_size * 2));
+    auto *signal_stack = (std::uint8_t *)vm_alloc(signal_stack_size + (page_size * 2));
+    if (buffer == nullptr || stack == nullptr || data == nullptr || signal_stack == nullptr)
     {
         ready.error = ChildError::Allocation;
 
-        write_all(ready_descriptor, &ready, sizeof(ready));
+        write_all(report_descriptor, &ready, sizeof(ready));
         _exit(1);
     }
 
     auto *code_base = buffer + code_region - request.code.size();
     if (!vm_commit(buffer, code_region, VMProtection::ReadWrite)
         || !vm_commit(stack + page_size, SCRATCH_STACK_BYTES, VMProtection::ReadWrite)
-        || !vm_commit(data + page_size, SCRATCH_DATA_BYTES, VMProtection::ReadWrite))
+        || !vm_commit(data + page_size, SCRATCH_DATA_BYTES, VMProtection::ReadWrite)
+        || !vm_commit(signal_stack + page_size, signal_stack_size, VMProtection::ReadWrite))
     {
         ready.error = ChildError::Commit;
 
-        write_all(ready_descriptor, &ready, sizeof(ready));
+        write_all(report_descriptor, &ready, sizeof(ready));
         _exit(1);
     }
 
@@ -237,7 +309,7 @@ void child_main(const PlatformRunRequest &request, int ready_descriptor, std::si
     {
         ready.error = ChildError::Protect;
 
-        write_all(ready_descriptor, &ready, sizeof(ready));
+        write_all(report_descriptor, &ready, sizeof(ready));
         _exit(1);
     }
 
@@ -245,17 +317,46 @@ void child_main(const PlatformRunRequest &request, int ready_descriptor, std::si
     {
         ready.error = ChildError::Flush;
 
-        write_all(ready_descriptor, &ready, sizeof(ready));
+        write_all(report_descriptor, &ready, sizeof(ready));
+        _exit(1);
+    }
+
+    stack_t alternate_signal_stack{};
+    alternate_signal_stack.ss_sp    = signal_stack + page_size;
+    alternate_signal_stack.ss_size  = signal_stack_size;
+    alternate_signal_stack.ss_flags = 0;
+
+    struct sigaction fault_action{};
+    fault_action.sa_sigaction = fault_report_handler;
+    fault_action.sa_flags     = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+    sigemptyset(&fault_action.sa_mask);
+
+    sigset_t fault_signal_mask{};
+    sigemptyset(&fault_signal_mask);
+    sigaddset(&fault_signal_mask, SIGSEGV);
+    sigaddset(&fault_signal_mask, SIGBUS);
+    if (sigaltstack(&alternate_signal_stack, nullptr)
+        != 0
+        || sigaction(SIGSEGV, &fault_action, nullptr)
+        != 0
+        || sigaction(SIGBUS, &fault_action, nullptr)
+        != 0
+        || sigprocmask(SIG_UNBLOCK, &fault_signal_mask, nullptr)
+        != 0)
+    {
+        ready.error = ChildError::SignalSetup;
+
+        write_all(report_descriptor, &ready, sizeof(ready));
         _exit(1);
     }
 
     initialize_fpu();
 
     ready.code_base   = (std::uint64_t)code_base;
-    ready.initial_rsp = (std::uint64_t)(stack + page_size + SCRATCH_STACK_BYTES - 0x100) & ~(std::uint64_t)15;
+    ready.initial_rsp = (std::uint64_t)(stack + page_size + SCRATCH_STACK_BYTES - SCRATCH_STACK_HEADROOM) & ~(std::uint64_t)15;
     ready.data_base   = (std::uint64_t)(data + page_size);
 
-    if (!write_all(ready_descriptor, &ready, sizeof(ready)))
+    if (!write_all(report_descriptor, &ready, sizeof(ready)))
     {
         _exit(1);
     }
@@ -339,12 +440,13 @@ const char *child_error_name(ChildError error) noexcept
 {
     switch (error)
     {
-    case ChildError::Trace:      return "ptrace worker setup failed.";
-    case ChildError::Allocation: return "Memory allocation failed.";
-    case ChildError::Commit:     return "Memory commit failed.";
-    case ChildError::Protect:    return "Memory protection failed.";
-    case ChildError::Flush:      return "Instruction-cache flush failed.";
-    default:                     return "Unknown worker setup failure.";
+    case ChildError::Trace:       return "ptrace worker setup failed.";
+    case ChildError::Allocation:  return "Memory allocation failed.";
+    case ChildError::Commit:      return "Memory commit failed.";
+    case ChildError::Protect:     return "Memory protection failed.";
+    case ChildError::Flush:       return "Instruction-cache flush failed.";
+    case ChildError::SignalSetup: return "Fault-report handler setup failed.";
+    default:                      return "Unknown worker setup failure.";
     }
 }
 
@@ -423,10 +525,10 @@ bool copy_to_clipboard(std::string_view text) noexcept
 
     for (std::size_t offset{}; offset < text.size(); offset += 3)
     {
-        auto                first  = (std::uint8_t)text[offset];
-        std::uint8_t        second = offset + 1 < text.size() ? (std::uint8_t)text[offset + 1] : 0;
-        std::uint8_t        third  = offset + 2 < text.size() ? (std::uint8_t)text[offset + 2] : 0;
-        std::array<char, 4> encoded{
+        auto         first  = (std::uint8_t)text[offset];
+        std::uint8_t second = offset + 1 < text.size() ? (std::uint8_t)text[offset + 1] : 0;
+        std::uint8_t third  = offset + 2 < text.size() ? (std::uint8_t)text[offset + 2] : 0;
+        std::array   encoded{
             encode(first >> 2),
             encode((first & 0x3) << 4 | second >> 4),
             offset + 1 < text.size() ? encode((second & 0xF) << 2 | third >> 6) : '=',
@@ -482,6 +584,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
 
     // Query before `fork` because `sysconf` need not be async-signal-safe.
     auto page_size         = vm_page_size();
+    auto signal_stack_size = (std::size_t)SIGSTKSZ + page_size - 1 & ~(page_size - 1);
     auto data_reserve_base = scratch_reserve_base();
     auto child             = fork();
     if (child == -1)
@@ -498,19 +601,26 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     if (child == 0)
     {
         close(pipe_descriptors[0]);
-        child_main(request, pipe_descriptors[1], page_size, data_reserve_base);
+        child_main(request, pipe_descriptors[1], page_size, signal_stack_size, data_reserve_base);
     }
 
     close(pipe_descriptors[1]);
 
+    auto close_report_descriptor = [&pipe_descriptors]() noexcept
+    {
+        if (pipe_descriptors[0] != -1)
+        {
+            close(pipe_descriptors[0]);
+            pipe_descriptors[0] = -1;
+        }
+    };
+
     ChildReady ready{};
     auto       ready_received = read_all(pipe_descriptors[0], &ready, sizeof(ready));
-
-    close(pipe_descriptors[0]);
-
     if (!ready_received)
     {
         terminate_child(child);
+        close_report_descriptor();
 
         result.outcome = Outcome::Error;
         result.error   = "ptrace worker startup failed.";
@@ -522,6 +632,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     if (!wait_for_child(child, status))
     {
         terminate_child(child);
+        close_report_descriptor();
 
         result.outcome = Outcome::Error;
         result.error   = "ptrace worker wait failed.";
@@ -533,6 +644,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     {
         result.outcome = Outcome::Error;
         result.error   = child_error_name(ready.error);
+        close_report_descriptor();
 
         return result;
     }
@@ -540,6 +652,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
     if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGSTOP)
     {
         terminate_child(child);
+        close_report_descriptor();
 
         result.outcome = Outcome::Error;
         result.error   = "ptrace worker did not stop.";
@@ -547,9 +660,10 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
         return result;
     }
 
-    auto fail = [&result, child](std::string error)
+    auto fail = [&result, child, &close_report_descriptor](std::string error)
     {
         terminate_child(child);
+        close_report_descriptor();
 
         result.outcome = Outcome::Error;
         result.error   = std::move(error);
@@ -643,6 +757,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
         result.stopped_at_target = true;
 
         terminate_child(child);
+        close_report_descriptor();
 
         return result;
     }
@@ -673,22 +788,24 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
             result.stop_address = previous_rip;
 
             terminate_child(child);
+            close_report_descriptor();
 
             return result;
         }
 
         auto signal = WSTOPSIG(status);
+
+        siginfo_t signal_info{};
+        if (ptrace(PTRACE_GETSIGINFO, child, nullptr, &signal_info) == -1)
+        {
+            return fail("ptrace signal info failed.");
+        }
+
         bool single_step_trap{};
         bool breakpoint_signal{};
         bool breakpoint_trap{};
         if (signal == SIGTRAP)
         {
-            siginfo_t signal_info{};
-            if (ptrace(PTRACE_GETSIGINFO, child, nullptr, &signal_info) == -1)
-            {
-                return fail("ptrace signal info failed.");
-            }
-
             breakpoint_signal = signal_info.si_code == TRAP_BRKPT || signal_info.si_code == SI_KERNEL;
             breakpoint_trap   = breakpoint_signal && is_software_breakpoint(request.code, ready.code_base, previous_rip);
             single_step_trap  = signal_info.si_code == TRAP_TRACE;
@@ -706,6 +823,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
             result.stop_address = previous_rip;
 
             terminate_child(child);
+            close_report_descriptor();
 
             return result;
         }
@@ -729,7 +847,20 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
             result.fault_name   = fault_name(signal);
             result.stop_address = result.steps.back().rip;
 
+            if (signal == SIGSEGV || signal == SIGBUS)
+            {
+                result.fault_memory_address = (std::uint64_t)signal_info.si_addr;
+                result.fault_access         = FaultAccess::Unknown;
+
+                FaultReport report{};
+                if (collect_fault_report(child, pipe_descriptors[0], signal, report))
+                {
+                    result.fault_access = classify_fault_access(report, *result.fault_memory_address);
+                }
+            }
+
             terminate_child(child);
+            close_report_descriptor();
 
             return result;
         }
@@ -747,6 +878,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
             result.stopped_at_target = true;
 
             terminate_child(child);
+            close_report_descriptor();
 
             return result;
         }
@@ -756,6 +888,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
             result.outcome = Outcome::Finished;
 
             terminate_child(child);
+            close_report_descriptor();
 
             return result;
         }
@@ -765,6 +898,7 @@ PlatformRunResult run_platform_steps(const PlatformRunRequest &request)
             result.outcome = Outcome::AbortedCap;
 
             terminate_child(child);
+            close_report_descriptor();
 
             return result;
         }
