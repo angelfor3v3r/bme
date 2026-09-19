@@ -151,10 +151,12 @@ auto make_trace()
         }
     );
 
-    result.outcome      = Outcome::Faulted;
-    result.message      = "Synthetic \"fault\"\nmessage";
-    result.stop_reason  = "Synthetic fault";
-    result.stop_address = 0x2000;
+    result.outcome              = Outcome::Faulted;
+    result.message              = "Synthetic \"fault\"\nmessage";
+    result.stop_reason          = "Synthetic fault";
+    result.stop_address         = 0x2000;
+    result.fault_memory_address = 0xDEAD;
+    result.fault_access         = FaultAccess::Write;
 
     return result;
 }
@@ -305,6 +307,8 @@ TEST(TraceJson, EmitsVersionedPortableDocument)
     EXPECT_EQ(execution.at("message").get_string(), "Synthetic \"fault\"\nmessage");
     EXPECT_EQ(execution.at("stop_reason").get_string(), "Synthetic fault");
     EXPECT_EQ(execution.at("stop_address").get_string(), "0x0000000000002000");
+    EXPECT_EQ(execution.at("fault_memory_address").get_string(), "0x000000000000DEAD");
+    EXPECT_EQ(execution.at("fault_access").get_string(), "write");
     EXPECT_EQ(execution.at("seed").at("gpr").at("rax").get_string(), "0x1111111111111111");
 
     auto &events = execution.at("events").get_array();

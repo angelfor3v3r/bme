@@ -18,7 +18,7 @@ decoders can disagree on the same bytes. Executing on real silicon (and swapping
 ## Features
 
 - Single-step execution with full GPR, RFLAGS, SSE (XMM), and x87 state after every completed instruction
-- Faulting instructions retain and display their exception-time partial register state without counting as executed. Fault-time RFLAGS includes processor exception-delivery changes, such as RF being set for fault-class exceptions
+- Faulting instructions retain and display their exception-time partial register state without counting as executed. Fault-time RFLAGS includes processor exception-delivery changes such as RF being set for fault-class exceptions. Memory faults report the operand address where the OS provides it, plus read, write, or execute access for Windows access violations and Linux x86 page faults
 - GPR sub-register drill-down (RAX -> EAX -> AX -> AH/AL), seed any level before a run
 - x87 FPU and MXCSR shown in detail - each `ST(i)` with its physical `x87rN`, tag, 80-bit raw and value, plus decoded control/status words and MXCSR fields
 - XMM shows a decoded `f64x2` view by default, expandable to `f32x4`. x87 has a matching narrowed `Real4` view, showing what an `FSTP m32` would store
@@ -27,13 +27,13 @@ decoders can disagree on the same bytes. Executing on real silicon (and swapping
 - Seed status flags too - click any flag in the Flags panel (CF/PF/AF/ZF/SF/OF/DF). RF appears as read-only exception state when set on a selected fault row
 - Seed XMM and x87 `ST(i)` registers too, as raw hex or a decimal value (`1.5`, optional `f` for single precision or `l` for double precision), from the SSE / x87 panels or `--seed`
 - Seed MXCSR and the x87 control word as hex from the SSE / x87 panels or `--seed`
-- Scratch data buffer one guard page above a fixed reservation. The header shows the code and usable data bases. RDI and RSI receive the data base by default (toggle in Settings), or paste it into any seedable register
-- Click any register value (GPR, XMM, MXCSR, x87, or an individual float in a drill-down) to copy it to the clipboard
+- Guarded 64 KiB scratch stack and data regions, each with no-access pages on both sides. The header shows the absolute code base and input size, initial RSP and stack size, and usable data base and size. RDI and RSI receive the data base by default (toggle in Settings), or paste it into any seedable register
+- Click any register value (GPR, XMM, MXCSR, x87, or an individual float in a drill-down) to copy its raw value. Shift-click a full GPR or header address to copy its normalized sandbox address when available
 - Copy the selected History row with **Copy row**, or rerun from the configured seed and stop before its address with **Run to row**
 - Keyboard shortcuts. **F5** run, **F8** step, **F7** back
 - Headless `--quick` output as a human-readable trace or versioned JSON with full machine state, CPU provenance, dependency revisions, and all decoder histories
 - Detects Intel SDE and Pin instrumentation from environment markers. Windows also checks parent processes and loaded modules. Execution is refused because instrumented single-step state cannot be trusted
-- History panel has a `Main` tab plus one tab per decoder (`zydis`, `bddisasm`, `capstone`, `xed`). Each backend applies its own instruction boundaries to the original bytes without re-running the code. Faults and stop rows are emphasized, static rows are dimmed, and code or scratch-data addresses use stable `code+offset` / `data+offset` forms by default. Settings switches to absolute addresses
+- History panel has a `Main` tab plus one tab per decoder (`zydis`, `bddisasm`, `capstone`, `xed`). Each backend applies its own instruction boundaries to the original bytes without re-running the code. Faults and stop rows are emphasized, static rows are dimmed, and code, scratch-stack, or scratch-data addresses use stable `code+offset`, `stack+offset`, or `data+offset` forms by default. Stack offsets are relative to the initial RSP. Exact one-past-end addresses and addresses inside known no-access pages are marked as ends or guards. Settings switches to absolute addresses
 
 ## Usage
 
@@ -98,7 +98,7 @@ bme --bytes 48FFC0 --quick --format json --pretty            # export indented J
 - BME version, commit, repository, and compiled dependency versions and revisions
 - Capture OS, architecture, and a process-visible CPU fingerprint with raw CPUID records
 - The requested bytes, seed, backend, syntax, step cap, and scratch-pointer policy
-- The actual seed, every completed or faulted execution event, outcome, message, and stop location
+- The actual seed, every completed or faulted execution event, outcome, message, stop location, and available faulting memory address and access type
 - Native disassembly histories for all four compiled decoder backends, including each effective syntax
 
 Register values, addresses, feature masks, XMM lanes, and x87 values use fixed-width hexadecimal strings so ordinary JSON tooling cannot lose integer precision. Unavailable values use `null`. A fault raised by the supplied bytes is a successful recorded trace and returns exit code 0. An engine or instrumentation failure still emits a complete JSON document with outcome `error`, then returns nonzero. Invalid CLI arguments or byte input emit no JSON, write a diagnostic to stderr, and return nonzero. Serialization or stdout write failures also report to stderr and may leave a partial document on stdout.

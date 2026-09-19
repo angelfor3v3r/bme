@@ -208,6 +208,18 @@ std::string_view outcome_name(Outcome outcome) noexcept
 
 std::string_view event_kind_name(ExecutionEventKind kind) noexcept { return kind == ExecutionEventKind::Faulted ? "faulted" : "completed"; }
 
+std::optional<std::string_view> fault_access_name(FaultAccess access) noexcept
+{
+    switch (access)
+    {
+    case FaultAccess::Read:    return "read";
+    case FaultAccess::Write:   return "write";
+    case FaultAccess::Execute: return "execute";
+    case FaultAccess::Unknown: return "unknown";
+    default:                   return {};
+    }
+}
+
 std::string_view history_kind_name(HistoryRowKind kind) noexcept
 {
     switch (kind)
@@ -742,7 +754,19 @@ struct ExecutionView::glaze
             }
 
             return format_hex<16>(self.trace->stop_address);
-        }
+        },
+        "fault_memory_address",
+        [](const T &self) -> std::optional<std::string>
+        {
+            if (!self.trace->fault_memory_address)
+            {
+                return {};
+            }
+
+            return format_hex<16>(*self.trace->fault_memory_address);
+        },
+        "fault_access",
+        [](const T &self) { return fault_access_name(self.trace->fault_access); }
     );
 };
 

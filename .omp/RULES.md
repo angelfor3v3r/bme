@@ -18,7 +18,8 @@ Hard, always-apply rules. Background and implementation detail live in AGENTS.md
 ## Interfaces and verification
 
 - Preserve the interactive TUI.
-- Exercise changed runtime behavior through headless `--quick`, never by driving the interactive TUI.
+- Exercise engine and shared runtime behavior through headless `--quick`.
+- For TUI-only presentation or interaction that `--quick` cannot reach, smoke-test the actual TUI.
 - Keep TUI and CLI / `--quick` capabilities in parity where practical.
 - Unit tests live in `test/`, use GoogleTest, link `bme_core`, and run through `ctest` when `BME_BUILD_TESTS` is enabled.
 - Test BME-owned parsing, seeding, engine orchestration, and `--quick` behavior. Never assert decoder correctness or CPU instruction semantics.

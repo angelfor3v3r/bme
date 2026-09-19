@@ -71,6 +71,15 @@ enum class Outcome : std::uint8_t
     Stopped,
 };
 
+enum class FaultAccess : std::uint8_t
+{
+    None = 0,
+    Read,
+    Write,
+    Execute,
+    Unknown,
+};
+
 enum class DisasmSyntax : std::uint8_t
 {
     Intel = 0,
@@ -210,11 +219,13 @@ struct Trace
     std::vector<ExecutionEvent> execution_events{};
 
     // Outcome.
-    Outcome       outcome = Outcome::Idle;
-    std::string   message{};
-    bool          instrumentation_detected{}; // Platform tracing was refused because instrumentation was detected.
-    std::string   stop_reason{};              // Reason execution halted (labels the stop instruction).
-    std::uint64_t stop_address{};             // Address of the stop instruction (int3/fault), 0 otherwise.
+    Outcome                      outcome = Outcome::Idle;
+    std::string                  message{};
+    bool                         instrumentation_detected{}; // Platform tracing was refused because instrumentation was detected.
+    std::string                  stop_reason{};              // Reason execution halted and the label shown on its row.
+    std::uint64_t                stop_address{};             // Instruction address for an int3, fault, or selected-row stop.
+    std::optional<std::uint64_t> fault_memory_address{};     // Memory operand address reported for a fault, when available.
+    FaultAccess                  fault_access = FaultAccess::None;
 };
 
 struct CLI

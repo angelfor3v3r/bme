@@ -29,7 +29,45 @@ TEST(RunEngineFault, PreservesExceptionStateWithoutCompletingInstruction)
     ASSERT_NE(fault, trace.execution_events.end());
     EXPECT_EQ(fault->rip, trace.stop_address);
     EXPECT_EQ(fault->registers.rip, trace.stop_address);
+    EXPECT_FALSE(trace.fault_memory_address);
+    EXPECT_EQ(trace.fault_access, FaultAccess::None);
 }
+
+TEST(RunEngineFault, ReportsGuardedMemoryOperand)
+{
+    std::array<std::uint8_t, 7> code{0xC6, 0x87, 0x00, 0x00, 0x01, 0x00, 0x00};
+    Registers                   seed{};
+    auto                        trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
+    ASSERT_EQ(trace.outcome, Outcome::Faulted);
+    ASSERT_TRUE(trace.fault_memory_address);
+    EXPECT_EQ(*trace.fault_memory_address, scratch_data_base() + SCRATCH_DATA_BYTES);
+    EXPECT_EQ(trace.fault_access, FaultAccess::Write);
+    EXPECT_NE(trace.message.find("data+10000 (end, guard)"), std::string::npos);
+}
+
+TEST(RunEngineFault, ReportsGuardedMemoryRead)
+{
+    std::array<std::uint8_t, 6> code{0x8A, 0x87, 0x00, 0x00, 0x01, 0x00};
+    Registers                   seed{};
+    auto                        trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
+    ASSERT_EQ(trace.outcome, Outcome::Faulted);
+    ASSERT_TRUE(trace.fault_memory_address);
+    EXPECT_EQ(*trace.fault_memory_address, scratch_data_base() + SCRATCH_DATA_BYTES);
+    EXPECT_EQ(trace.fault_access, FaultAccess::Read);
+}
+
+#if BME_OS_LINUX
+TEST(RunEngineFault, ReportsAccessWithUnusableStackPointer)
+{
+    std::array<std::uint8_t, 11> code{0x48, 0x81, 0xC4, 0x00, 0x01, 0x00, 0x00, 0xC6, 0x04, 0x24, 0x00};
+    Registers                    seed{};
+    auto                         trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
+    ASSERT_EQ(trace.outcome, Outcome::Faulted);
+    ASSERT_TRUE(trace.fault_memory_address);
+    EXPECT_EQ(*trace.fault_memory_address, trace.seed[Reg::RSP] + SCRATCH_STACK_HEADROOM);
+    EXPECT_EQ(trace.fault_access, FaultAccess::Write);
+}
+#endif
 
 TEST(RunEngineBreakpoint, StopsOnPrefixedInt3WithoutCompletingInstruction)
 {
@@ -70,6 +108,9 @@ TEST(RunEngineBoundary, IncompleteInstructionFaultsWithoutPadding)
     auto                        trace = run_engine(code, seed, DEFAULT_MAX_STEPS, DisasmBackend::Zydis, DisasmSyntax::Intel, true);
     EXPECT_EQ(trace.outcome, Outcome::Faulted);
     EXPECT_EQ(std::ranges::count(trace.execution_events, ExecutionEventKind::Completed, &ExecutionEvent::kind), 0);
+    ASSERT_TRUE(trace.fault_memory_address);
+    EXPECT_EQ(*trace.fault_memory_address, trace.seed[Reg::RIP] + trace.code.size());
+    EXPECT_EQ(trace.fault_access, FaultAccess::Execute);
 
     auto history = build_history(trace, DisasmBackend::Zydis, DisasmSyntax::Intel);
     ASSERT_EQ(history.size(), 1u);
